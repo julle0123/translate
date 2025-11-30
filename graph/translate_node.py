@@ -1,8 +1,9 @@
-"""번역 노드 - LangGraph 노드에서 사용하는 번역 함수"""
+"""번역 노드 - LangGraph 노드에서 사용하는 번역 함수 (이미지 코드 구조)"""
 import os
 import asyncio
 import re
 import logging
+import time
 from asyncio import Queue
 from typing import Dict, Any, List, Optional, Callable
 from langchain_openai import ChatOpenAI
@@ -18,53 +19,113 @@ from schema.schemas import ServiceInfo, UserInfo
 LOGGER = logging.getLogger(__name__)
 
 
-class TranslateNode:
-    """번역 노드 클래스 - 프롬프트 호출, 청크 분할, 병렬 astream 처리"""
+class TranslateAgent:
+    """번역 에이전트 클래스 (이미지 코드 구조)"""
     
     def __init__(
         self,
-        llm: ChatOpenAI,
-        callback: Optional[Callable] = None,
-        service_info: Optional[ServiceInfo] = None,
-        user_info: Optional[UserInfo] = None,
-        chunk_size: Optional[int] = None,
-        chunk_overlap: Optional[int] = None,
-        max_concurrent: Optional[int] = None
+        service_info: Optional[Dict[str, Any]] = None,
+        chat_req: Optional[Dict[str, Any]] = None,
+        llm: Optional[ChatOpenAI] = None,
+        callbacks: Optional[List] = None
     ):
         """
-        초기화
+        초기화 (이미지 코드 구조)
         
         Args:
+            service_info: 서비스 정보
+            chat_req: 채팅 요청 정보
             llm: LLM 인스턴스
-            callback: 콜백 함수 (선택사항)
-            service_info: 서비스 정보 (선택사항)
-            user_info: 사용자 정보 (선택사항)
-            chunk_size: 청크 크기 (기본값: 환경변수 또는 2000)
-            chunk_overlap: 청크 오버랩 (기본값: 환경변수 또는 200)
-            max_concurrent: 최대 동시 처리 수 (기본값: 환경변수 또는 5)
+            callbacks: 콜백 리스트
         """
-        self.llm = llm
-        self.callback = callback
+        self.agent_name = "TranslateAgent"
         self.service_info = service_info
-        self.user_info = user_info
+        self.chat_req = chat_req
+        self.llm = llm or ChatOpenAI(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            temperature=0.3,
+            streaming=True,
+            openai_api_key=os.getenv("OPENAI_API_KEY")
+        )
+        self.callbacks = callbacks or []
         
         # 설정값 (환경변수 우선, 없으면 기본값)
-        self.chunk_size = chunk_size or int(os.getenv("TRANSLATE_CHUNK_SIZE", "2000"))
-        self.chunk_overlap = chunk_overlap or int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "200"))
-        self.max_concurrent = max_concurrent or int(os.getenv("TRANSLATE_MAX_CONCURRENT", "5"))
+        self.chunk_size = int(os.getenv("TRANSLATE_CHUNK_SIZE", "2000"))
+        self.chunk_overlap = int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "200"))
+        self.max_concurrent = int(os.getenv("TRANSLATE_MAX_CONCURRENT", "5"))
         
         # 토큰 사용량 추적 (이미지 코드와 동일한 변수명)
         self.crt_step_inpt_tokn_cnt = 0
         self.crt_step_otpt_tokn_cnt = 0
         self.crt_step_totl_tokn_cnt = 0
         
-        LOGGER.info(f"TranslateNode 초기화: chunk_size={self.chunk_size}, chunk_overlap={self.chunk_overlap}, max_concurrent={self.max_concurrent}")
+        LOGGER.info(f"TranslateAgent 초기화: chunk_size={self.chunk_size}, chunk_overlap={self.chunk_overlap}, max_concurrent={self.max_concurrent}")
+    
+    async def __call__(
+        self,
+        state: TranslationState,
+        config: Optional[Dict[str, Any]] = None
+    ) -> TranslationState:
+        """LangGraph에서 호출되는 메서드 (이미지 코드 구조)"""
+        self.agent_start_time = time.time()
+        if self.service_info:
+            state["service_info"] = self.service_info
+        
+        try:
+            await self.preprocess(state)
+            await self.run(state, config)
+        except Exception as e:
+            import traceback
+            error_msg = f"TranslateAgent 오류: {str(e)}\n{traceback.format_exc()}"
+            LOGGER.error(error_msg)
+            raise
+        
+        return state
+    
+    async def preprocess(self, state: TranslationState) -> TranslationState:
+        """전처리 (이미지 코드 구조)"""
+        # TRNSL_LANG_CD_MAP을 사용하여 번역 언어 코드 가져오기
+        TRNSL_LANG_CD_MAP = {
+            "ENG": "en",
+            "KOR": "ko",
+            "JPN": "ja",
+            "CHN": "zh",
+            "VNM": "vi",
+            "FRA": "fr",
+            "THA": "th",
+            "PHL": "tl",
+            "KHM": "km",
+        }
+        
+        trnsl_lang_cd = TRNSL_LANG_CD_MAP.get(
+            self.service_info.get("trans_lang", "ENG") if self.service_info else "ENG",
+            "en"
+        )
+        
+        # generate_determine_prompt를 사용하여 프롬프트 생성
+        from prompt.prompts import create_translation_prompt
+        from utils.language_utils import get_language_name
+        
+        target_lang_name = get_language_name(trnsl_lang_cd)
+        prompt = create_translation_prompt(trnsl_lang_cd, target_lang_name)
+        
+        # 프롬프트 토큰 수 로깅 (이미지 코드 구조)
+        # TODO: 실제 토큰 수 계산 로직 추가 필요
+        token = len(prompt.split())  # 간단한 단어 수로 대체
+        LOGGER.info(f"프롬프트 토큰 수: {token}")
+        
+        # state에 프롬프트 저장
+        state["prompt"] = prompt
+        state["target_lang_cd"] = trnsl_lang_cd
+        state["target_lang_name"] = target_lang_name
+        
+        return state
     
     async def run(
         self,
         state: TranslationState,
         config: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> TranslationState:
         """
         사용자의 질문을 LLM을 통해 검색에 최적화된 쿼리로 재작성합니다.
         청크 분할 및 병렬 처리를 포함합니다.
@@ -81,11 +142,9 @@ class TranslateNode:
             chunks = [original_text]
         else:
             # 더 큰 청크 크기 사용 (청크 수 감소로 전체 처리 시간 단축)
-            # 텍스트가 길수록 더 큰 청크 사용
             dynamic_chunk_size = min(self.chunk_size * 2, len(original_text))
             
             # 오버랩 없이 청크를 나누기 (중복 번역 방지)
-            # 문맥 정보는 이전/다음 청크의 일부를 프롬프트에 포함하므로 오버랩 불필요
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=dynamic_chunk_size,
                 chunk_overlap=0,  # 오버랩 제거로 중복 번역 방지
@@ -100,11 +159,9 @@ class TranslateNode:
         CustomAsyncCallbackHandler = None
         
         # Queue와 CallbackHandler 클래스 추출
-        # callbacks에서 Queue 추출
         if isinstance(run_config, dict):
             callbacks = run_config.get("callbacks", [])
             if callbacks:
-                # AsyncCallbackManager인 경우 handlers 속성 사용
                 if hasattr(callbacks, 'handlers'):
                     callbacks_list = callbacks.handlers
                 elif isinstance(callbacks, list):
@@ -117,16 +174,13 @@ class TranslateNode:
                     if hasattr(first_callback, 'queue'):
                         queue = first_callback.queue
             
-            # configurable에서 추출
             configurable = run_config.get("configurable", {})
             if not queue:
                 queue = configurable.get("streaming_queue")
             CustomAsyncCallbackHandler = configurable.get("callback_handler_class")
         else:
-            # RunnableConfig 객체인 경우
             if hasattr(run_config, "callbacks") and run_config.callbacks:
                 callbacks_obj = run_config.callbacks
-                # AsyncCallbackManager인 경우 handlers 속성 사용
                 if hasattr(callbacks_obj, 'handlers'):
                     callbacks_list = callbacks_obj.handlers
                 elif isinstance(callbacks_obj, list):
@@ -150,6 +204,9 @@ class TranslateNode:
         if not CustomAsyncCallbackHandler:
             raise ValueError("CustomAsyncCallbackHandler 클래스가 필요합니다. orchestrator에서 전달해야 합니다.")
         
+        # llm을 외부 스코프에서 캡처 (중첩 함수에서 self 접근 문제 해결)
+        llm_instance = self.llm
+        
         # 공통 번역 함수 (astream 최적화 + 인덱스 기반 callback)
         async def translate_single_chunk(chunk: str, prompt: str, chunk_index: int) -> str:
             """단일 청크를 번역하는 공통 함수 (인덱스 기반 callback)"""
@@ -159,8 +216,6 @@ class TranslateNode:
             ]
             
             # 인덱스별 callback 생성 (이미지 코드 구조 - queue만 전달)
-            # CustomAsyncCallbackHandler는 이미지 코드 그대로 유지하고, 
-            # 인덱스 정보를 포함한 래퍼 Queue 사용
             class IndexedQueue:
                 """인덱스 정보를 포함한 Queue 래퍼"""
                 def __init__(self, queue: Queue, chunk_index: int):
@@ -174,13 +229,12 @@ class TranslateNode:
             indexed_queue = IndexedQueue(queue, chunk_index)
             callback_instance = CustomAsyncCallbackHandler(indexed_queue)
             callbacks = [callback_instance]
-            chunk_config = {"callbacks": callbacks}
             
-            # astream을 사용하여 스트리밍 번역 (config 포함)
+            # astream을 사용하여 스트리밍 번역 (callbacks 직접 전달)
             result = ""
             last_chunk_response = None
             
-            async for chunk_response in self.llm.astream(messages, config=chunk_config):
+            async for chunk_response in llm_instance.astream(messages, callbacks=callbacks):
                 # 콘텐츠가 있으면 바로 누적
                 if chunk_response.content:
                     result += chunk_response.content
@@ -204,19 +258,18 @@ class TranslateNode:
             
             return result.strip() if result else ""
         
-        
         # 청크가 1개면 기존 방식대로 처리 (병렬 처리 오버헤드 제거)
         if len(chunks) == 1:
-            result = await translate_single_chunk(chunks[0], base_prompt, 1)  # 인덱스 1부터 시작
+            result = await translate_single_chunk(chunks[0], base_prompt, 0)  # 인덱스 0부터 시작
             state['answer'] = result
             return state
         
-        # 3. 청크가 여러 개일 때 병렬 처리 (인덱스 1부터 시작)
+        # 3. 청크가 여러 개일 때 병렬 처리 (인덱스 0부터 시작)
         semaphore = asyncio.Semaphore(self.max_concurrent)
         
         async def translate_chunk_parallel(
             chunk: str,
-            chunk_index: int,  # 1부터 시작하는 인덱스
+            chunk_index: int,  # 0부터 시작하는 인덱스
             previous_chunk: Optional[str] = None,
             next_chunk: Optional[str] = None
         ) -> tuple[int, str]:
@@ -242,9 +295,9 @@ class TranslateNode:
                 result = await translate_single_chunk(chunk, context_prompt, chunk_index)
                 return chunk_index, result
         
-        # 모든 청크를 병렬로 번역 (인덱스는 1부터 시작)
+        # 모든 청크를 병렬로 번역 (인덱스는 0부터 시작)
         tasks = []
-        for i, chunk in enumerate(chunks, start=1):  # 1부터 시작
+        for i, chunk in enumerate(chunks, start=0):  # 0부터 시작
             previous_chunk = chunks[i - 2] if i > 1 else None
             next_chunk = chunks[i] if i < len(chunks) else None
             tasks.append(translate_chunk_parallel(chunk, i, previous_chunk, next_chunk))
@@ -297,38 +350,3 @@ class TranslateNode:
         state['answer'] = final_result
         
         return state
-
-    async def __call__(
-        self,
-        state: TranslationState,
-        config: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """LangGraph에서 노드처럼 호출될 때 run을 실행"""
-        return await self.run(state, config)
-
-
-# LangGraph 노드에서 직접 사용할 수 있는 함수
-async def translate_node(state: TranslationState, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    번역 노드 함수 - LangGraph에서 직접 사용
-    
-    Args:
-        state: 번역 상태 (LLM은 내부에서 생성)
-        config: LangGraph에서 전달하는 config (callbacks 포함)
-    
-    Returns:
-        dict: 번역 결과
-    """
-    from langchain_core.runnables import RunnableConfig
-    
-    # LLM 생성
-    llm = ChatOpenAI(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        temperature=0.3,
-        streaming=True,
-        openai_api_key=os.getenv("OPENAI_API_KEY")
-    )
-    
-    # TranslateNode 인스턴스 생성 및 실행 (config 전달)
-    node = TranslateNode(llm=llm)
-    return await node(state, config)
