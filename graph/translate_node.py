@@ -298,8 +298,8 @@ class TranslateAgent:
         # 모든 청크를 병렬로 번역 (인덱스는 0부터 시작)
         tasks = []
         for i, chunk in enumerate(chunks, start=0):  # 0부터 시작
-            previous_chunk = chunks[i - 2] if i > 1 else None
-            next_chunk = chunks[i] if i < len(chunks) else None
+            previous_chunk = chunks[i - 1] if i > 0 else None
+            next_chunk = chunks[i + 1] if i < len(chunks) - 1 else None
             tasks.append(translate_chunk_parallel(chunk, i, previous_chunk, next_chunk))
         
         results = await asyncio.gather(*tasks)

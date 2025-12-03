@@ -2,6 +2,7 @@
 import time
 import os
 import json
+import asyncio
 from asyncio import Queue
 from typing import Optional, Dict, Any
 from langchain_openai import ChatOpenAI
@@ -111,7 +112,12 @@ class TranslationOrchestrator(BaseOrchestrator):
         
         # config 설정 (이미지 코드 구조)
         self.callbacks = [CustomAsyncCallbackHandler(self.queue)]
-        config = ensure_config({"callbacks": self.callbacks})
+        config = ensure_config({
+            "callbacks": self.callbacks,
+            "configurable": {
+                "callback_handler_class": CustomAsyncCallbackHandler
+            }
+        })
         
         # 상태 초기화 (message를 original_text로 사용)
         # target_lang_cd는 service_info에서 가져오거나 기본값 사용
@@ -143,108 +149,129 @@ class TranslationOrchestrator(BaseOrchestrator):
         next_expected_index = 0  # 다음에 처리할 청크 인덱스 (0부터 시작, 청크 번호)
         pending_spaces = {}  # 각 청크별 대기 중인 띄어쓰기 {chunk_index: " "}
         
+        # Queue 폴링을 위한 플래그
+        queue_poller_running = True
+        graph_completed = False
+        
+        # Queue 폴링 태스크: Queue에서 토큰을 받아서 버퍼에 저장
+        async def queue_poller():
+            """Queue에서 토큰을 지속적으로 폴링하여 버퍼에 저장"""
+            nonlocal queue_poller_running
+            while queue_poller_running:
+                try:
+                    # 타임아웃을 두어 주기적으로 체크
+                    chunk = await asyncio.wait_for(self.queue.get(), timeout=0.1)
+                    if chunk is None:
+                        continue
+                    
+                    # (chunk_index, token) 튜플 형태
+                    if isinstance(chunk, tuple):
+                        chunk_index, token = chunk
+                    else:
+                        chunk_index, token = (0, chunk)
+                    
+                    if token is None:
+                        continue
+                    
+                    # 버퍼 초기화
+                    if chunk_index not in stream_buffer:
+                        stream_buffer[chunk_index] = ""
+                        pending_spaces[chunk_index] = ""
+                    
+                    # 띄어쓰기 처리: 띄어쓰기만 오면 대기, 다음 토큰과 함께 처리
+                    if token == ' ':
+                        # 띄어쓰기만 있으면 대기
+                        pending_spaces[chunk_index] = ' '
+                    else:
+                        # 일반 토큰인 경우, 대기 중인 띄어쓰기가 있으면 함께 추가
+                        if pending_spaces.get(chunk_index):
+                            stream_buffer[chunk_index] += pending_spaces[chunk_index]
+                            pending_spaces[chunk_index] = ""
+                        stream_buffer[chunk_index] += token
+                except asyncio.TimeoutError:
+                    # 타임아웃은 정상 (Queue가 비어있을 때)
+                    continue
+                except Exception as e:
+                    # 에러 발생 시 로깅하고 계속
+                    import logging
+                    logging.error(f"Queue poller error: {e}")
+                    continue
+        
+        # Queue 폴링 태스크 시작
+        poller_task = asyncio.create_task(queue_poller())
+        
+        # 청크 완료 추적
+        chunk_completion_status = {}  # {chunk_index: bool}
+        expected_chunk_count = 0  # 예상 청크 개수 (나중에 업데이트)
+        
         # astream_events로 그래프 실행 (이미지 코드 구조)
         async for event in graph.astream_events(state, config=config):
-            if event["event"] == "on_chat_model_stream":
-                chunk = await self.queue.get()
-                if not chunk:
-                    stream_end = True
-                    continue
+            # 버퍼에서 순서대로 처리하는 로직
+            # next_expected_index부터 순서대로 처리
+            while next_expected_index in stream_buffer:
+                current_buffer = stream_buffer[next_expected_index]
+                last_length = last_sent_length.get(next_expected_index, 0)
                 
-                # (chunk_index, token) 튜플 형태
-                if isinstance(chunk, tuple):
-                    chunk_index, token = chunk
-                else:
-                    chunk_index, token = (0, chunk)
-                
-                if token is None:
-                    continue
-                
-                # 버퍼 초기화
-                if chunk_index not in stream_buffer:
-                    stream_buffer[chunk_index] = ""
-                    pending_spaces[chunk_index] = ""
-                
-                # 띄어쓰기 처리: 띄어쓰기만 오면 대기, 다음 토큰과 함께 처리
-                if token == ' ':
-                    # 띄어쓰기만 있으면 대기
-                    pending_spaces[chunk_index] = ' '
-                    continue
-                else:
-                    # 일반 토큰인 경우, 대기 중인 띄어쓰기가 있으면 함께 추가
-                    if pending_spaces.get(chunk_index):
-                        stream_buffer[chunk_index] += pending_spaces[chunk_index]
-                        pending_spaces[chunk_index] = ""
-                    stream_buffer[chunk_index] += token
-                
-                # 인덱스 순서대로 전달 (0번 청크를 한 글자씩 → 1번 청크로)
-                # streaming_index: 스트리밍 출력 인덱스 (0부터 시작, 각 메시지마다 증가)
-                # next_expected_index: 다음에 처리할 청크 번호 (0부터 시작, 청크 순서 보장)
-                # 중요: next_expected_index부터 순서대로 처리하여 청크 순서 보장
-                # 한 번의 이벤트에서 한 글자만 처리하고 break하여 순서 보장
-                # 0번 청크부터 순서대로 처리 (0번이 완료되면 1번으로)
-                # next_expected_index가 stream_buffer에 없으면 대기 (아직 해당 청크의 토큰이 안 들어옴)
-                if next_expected_index not in stream_buffer:
-                    # 아직 예상된 청크의 토큰이 안 들어왔으므로 대기
-                    continue
-                
-                # next_expected_index부터 순서대로 처리
-                while next_expected_index in stream_buffer:
-                    current_buffer = stream_buffer[next_expected_index]
-                    last_length = last_sent_length.get(next_expected_index, 0)
+                # 전달할 내용이 있는지 확인
+                if len(current_buffer) > last_length:
+                    # 현재 위치부터 읽기 시작
+                    remaining = current_buffer[last_length:]
                     
-                    # 전달할 내용이 있는지 확인
-                    if len(current_buffer) > last_length:
-                        # 현재 위치부터 읽기 시작
-                        remaining = current_buffer[last_length:]
-                        
-                        # 띄어쓰기로 시작하는 경우 다음 글자까지 읽기
-                        if remaining.startswith(' '):
-                            # 다음 글자가 있으면 함께 보내기
-                            if len(remaining) > 1:
-                                # 띄어쓰기 + 다음 글자
-                                chunk_to_send = remaining[:2]
-                                last_sent_length[next_expected_index] = last_length + 2
-                            else:
-                                # 다음 글자가 아직 없으면 대기 (다음 이벤트에서 처리)
-                                break
+                    # 띄어쓰기로 시작하는 경우 다음 글자까지 읽기
+                    if remaining.startswith(' '):
+                        # 다음 글자가 있으면 함께 보내기
+                        if len(remaining) > 1:
+                            # 띄어쓰기 + 다음 글자
+                            chunk_to_send = remaining[:2]
+                            last_sent_length[next_expected_index] = last_length + 2
                         else:
-                            # 일반 글자는 한 글자씩
-                            chunk_to_send = remaining[0]
-                            last_sent_length[next_expected_index] = last_length + 1
-                        
-                        # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
-                        sse_chunk = SSEChunk(
-                            index=streaming_index,
-                            step="message",
-                            rspns_msg=chunk_to_send,  # answer alias - 문자열만
-                            cmptn_yn=False,  # completion alias
-                            tokn_info={},  # TokenInfo 객체 (기본값)
-                            link_info=[],
-                            src_doc_info=[]
-                        )
-                        yield sse_chunk.to_msg()
-                        streaming_index += 1
-                        
-                        # 한 글자 전달하고 break (다음 이벤트에서 계속)
-                        break
+                            # 다음 글자가 아직 없으면 대기 (다음 이벤트에서 처리)
+                            break
                     else:
-                        # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
-                        next_expected_index += 1
-                continue
+                        # 일반 글자는 한 글자씩
+                        chunk_to_send = remaining[0]
+                        last_sent_length[next_expected_index] = last_length + 1
+                    
+                    # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
+                    sse_chunk = SSEChunk(
+                        index=streaming_index,
+                        step="message",
+                        rspns_msg=chunk_to_send,  # answer alias - 문자열만
+                        cmptn_yn=False,  # completion alias
+                        tokn_info={},  # TokenInfo 객체 (기본값)
+                        link_info=[],
+                        src_doc_info=[]
+                    )
+                    yield sse_chunk.to_msg()
+                    streaming_index += 1
+                    
+                    # 한 글자 전달하고 break (다음 이벤트에서 계속)
+                    break
+                else:
+                    # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
+                    next_expected_index += 1
             
-            elif event["event"] == "on_chat_model_end":
-                stream_end = True
-                continue
+            # 이벤트 처리
+            if event["event"] == "on_chat_model_end":
+                # 청크 완료 감지 (metadata에서 청크 인덱스 추출 시도)
+                # 주의: LangChain 이벤트에서 청크 인덱스를 직접 추출하기 어려울 수 있음
+                # 대신 모든 청크가 완료되었는지 확인하는 방식 사용
+                pass
             
             elif event["event"] == "on_chain_end":
                 _result = event["data"]
-                if stream_end:
-                    break
+                graph_completed = True
+                # 모든 청크가 완료되었는지 확인
+                # translate_node에서 state['answer']에 결과가 들어가면 완료로 간주
+                if _result and isinstance(_result, dict) and "output" in _result:
+                    output = _result["output"]
+                    if isinstance(output, dict) and "answer" in output:
+                        # answer가 있으면 번역이 완료된 것으로 간주
+                        break
             
             elif event["event"] == "on_chain_start":
-                if "langgraph_node" in event["metadata"].keys():
-                    if event["tags"][0] != "seq:step:1":
+                if "langgraph_node" in event.get("metadata", {}).keys():
+                    if event.get("tags", [""])[0] != "seq:step:1":
                         continue
                     if event["metadata"]["langgraph_node"] == "TRANSLATE_NODE":
                         status_message = "번역중.."
@@ -260,6 +287,14 @@ class TranslationOrchestrator(BaseOrchestrator):
                         )
                     else:
                         continue
+        
+        # Queue 폴링 태스크 종료
+        queue_poller_running = False
+        poller_task.cancel()
+        try:
+            await poller_task
+        except asyncio.CancelledError:
+            pass
         
         # 남은 버퍼 처리 (띄어쓰기는 다음 단어와 묶어서)
         # streaming_index는 계속 증가 (이미 설정된 값 유지)
