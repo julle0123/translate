@@ -156,7 +156,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         # Queue 폴링 태스크: Queue에서 토큰을 받아서 버퍼에 저장
         async def queue_poller():
             """Queue에서 토큰을 지속적으로 폴링하여 버퍼에 저장"""
-            nonlocal queue_poller_running
+            nonlocal queue_poller_running, stream_buffer, pending_spaces
             while queue_poller_running:
                 try:
                     # 타임아웃을 두어 주기적으로 체크
@@ -288,6 +288,10 @@ class TranslationOrchestrator(BaseOrchestrator):
                     else:
                         continue
         
+        # Queue 폴링 태스크 종료 전에 남은 토큰 처리 대기
+        # Queue에 남은 토큰이 모두 버퍼에 들어갈 때까지 잠시 대기
+        await asyncio.sleep(0.2)  # 짧은 대기로 남은 토큰 처리
+        
         # Queue 폴링 태스크 종료
         queue_poller_running = False
         poller_task.cancel()
@@ -342,7 +346,10 @@ class TranslationOrchestrator(BaseOrchestrator):
             last_sent_length[next_expected_index] = last_length
             next_expected_index += 1
         
-        result = _result["output"]
+        # _result 안전하게 처리
+        result = None
+        if _result and isinstance(_result, dict) and "output" in _result:
+            result = _result["output"]
         self.result = result
         
         # final 메시지 전송 (DataResponse 구조에 맞춰)
