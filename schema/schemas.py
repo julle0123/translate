@@ -1,7 +1,6 @@
 """API 요청/응답 스키마 정의"""
-from pydantic import BaseModel
-from typing import Optional
-from backend.schemas.apis.chat import DataResponse
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, List, Dict, Any
 
 
 class UserInfo(BaseModel):
@@ -22,6 +21,19 @@ class TranslationRequest(BaseModel):
     dmnd_msg: str
     user_info: UserInfo
     service_info: ServiceInfo
+
+
+class DataResponse(BaseModel):
+    """DataResponse 기본 클래스"""
+    model_config = ConfigDict(populate_by_name=True)
+    
+    index: int = Field(default=0, alias="index")
+    step: str = Field(default="message", alias="step")
+    rspns_msg: str = Field(default="", alias="answer")
+    cmptn_yn: bool = Field(default=False, alias="completion")
+    tokn_info: Dict[str, Any] = Field(default_factory=dict, alias="token_info")
+    link_info: List[Dict[str, Any]] = Field(default_factory=list, alias="link_info")
+    src_doc_info: List[Dict[str, Any]] = Field(default_factory=list, alias="src_doc_info")
 
 
 class SSEChunk(DataResponse):

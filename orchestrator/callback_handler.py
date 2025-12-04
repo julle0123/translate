@@ -28,12 +28,25 @@ class CustomAsyncCallbackHandler(AsyncCallbackHandler):
             token: 스트리밍되는 토큰
             **kwargs: 추가 인자
         """
-        # 이미지 코드 그대로
-        if len(kwargs["chunk"].message.response_metadata):
-            self.prompt_tokens += kwargs["chunk"].message.response_metadata["usage"]["prompt_tokens"]
-            self.completion_tokens += kwargs["chunk"].message.response_metadata["usage"]["completion_tokens"]
-            self.total_tokens += kwargs["chunk"].message.response_metadata["usage"]["total_tokens"]
-            await self.queue.put(None)
+        # 기존 코드 (이미지 코드 그대로 - 주석 처리)
+        # if len(kwargs["chunk"].message.response_metadata):
+        #     self.prompt_tokens += kwargs["chunk"].message.response_metadata["usage"]["prompt_tokens"]
+        #     self.completion_tokens += kwargs["chunk"].message.response_metadata["usage"]["completion_tokens"]
+        #     self.total_tokens += kwargs["chunk"].message.response_metadata["usage"]["total_tokens"]
+        #     await self.queue.put(None)
+        # else:
+        #     await self.queue.put(token)
+        
+        # 새로운 코드 (usage 안전 처리)
+        if kwargs.get("chunk") and kwargs["chunk"].message.response_metadata:
+            usage = kwargs["chunk"].message.response_metadata.get("usage", {})
+            if usage:
+                self.prompt_tokens += usage.get("prompt_tokens", 0)
+                self.completion_tokens += usage.get("completion_tokens", 0)
+                self.total_tokens += usage.get("total_tokens", 0)
+                await self.queue.put(None)
+            else:
+                await self.queue.put(token)
         else:
             await self.queue.put(token)
     
@@ -45,8 +58,23 @@ class CustomAsyncCallbackHandler(AsyncCallbackHandler):
             response: LLM 응답
             **kwargs: 추가 인자
         """
-        # 이미지 코드 그대로
-        self.prompt_tokens += response.generations[0][0].message.response_metadata["usage"]["prompt_tokens"]
-        self.completion_tokens += response.generations[0][0].message.response_metadata["usage"]["completion_tokens"]
-        self.total_tokens += response.generations[0][0].message.response_metadata["usage"]["total_tokens"]
+        # 기존 코드 (이미지 코드 그대로 - 주석 처리)
+        # self.prompt_tokens += response.generations[0][0].message.response_metadata["usage"]["prompt_tokens"]
+        # self.completion_tokens += response.generations[0][0].message.response_metadata["usage"]["completion_tokens"]
+        # self.total_tokens += response.generations[0][0].message.response_metadata["usage"]["total_tokens"]
+        
+        # 새로운 코드 (usage 안전 처리)
+        try:
+            if (response.generations and 
+                len(response.generations) > 0 and 
+                len(response.generations[0]) > 0 and
+                response.generations[0][0].message.response_metadata):
+                usage = response.generations[0][0].message.response_metadata.get("usage", {})
+                if usage:
+                    self.prompt_tokens += usage.get("prompt_tokens", 0)
+                    self.completion_tokens += usage.get("completion_tokens", 0)
+                    self.total_tokens += usage.get("total_tokens", 0)
+        except (KeyError, IndexError, AttributeError):
+            # usage가 없거나 구조가 다를 경우 무시
+            pass
 

@@ -142,13 +142,13 @@ async def translate_stream(request: TranslationRequest):
         
         # 스트리밍 번역 실행 (orchestrator 사용)
         from orchestrator.translation_orchestrator import TranslationOrchestrator
-        orchestrator = TranslationOrchestrator()
+        
+        # service_info 설정 (lang_cd는 node에서 처리)
+        service_info = {"lang_cd": target_lang_cd}
+        orchestrator = TranslationOrchestrator(service_info=service_info)
         
         async def generate():
-            async for chunk in orchestrator.translate_text_stream(
-                text=request.dmnd_msg,
-                target_lang_cd=target_lang_cd
-            ):
+            async for chunk in orchestrator.run(message=request.dmnd_msg):
                 yield chunk
         
         return StreamingResponse(

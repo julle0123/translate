@@ -17,6 +17,12 @@ from schema.schemas import ServiceInfo, UserInfo
 
 # 로거 설정
 LOGGER = logging.getLogger(__name__)
+# 로거 레벨 및 핸들러 설정 (터미널 출력용)
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
 
 
 class TranslateAgent:
@@ -84,23 +90,28 @@ class TranslateAgent:
     
     async def preprocess(self, state: TranslationState) -> TranslationState:
         """전처리 (이미지 코드 구조)"""
-        # TRNSL_LANG_CD_MAP을 사용하여 번역 언어 코드 가져오기
-        TRNSL_LANG_CD_MAP = {
-            "ENG": "en",
-            "KOR": "ko",
-            "JPN": "ja",
-            "CHN": "zh",
-            "VNM": "vi",
-            "FRA": "fr",
-            "THA": "th",
-            "PHL": "tl",
-            "KHM": "km",
-        }
-        
-        trnsl_lang_cd = TRNSL_LANG_CD_MAP.get(
-            self.service_info.get("trans_lang", "ENG") if self.service_info else "ENG",
-            "en"
-        )
+        # service_info에서 lang_cd 가져오기 (orchestrator에서 설정됨)
+        # lang_cd가 직접 전달되면 사용, 없으면 trans_lang에서 변환
+        if self.service_info and "lang_cd" in self.service_info:
+            # orchestrator에서 lang_cd를 직접 설정한 경우
+            trnsl_lang_cd = self.service_info.get("lang_cd", "en")
+        else:
+            # trans_lang을 사용하는 경우 (기존 로직)
+            TRNSL_LANG_CD_MAP = {
+                "ENG": "en",
+                "KOR": "ko",
+                "JPN": "ja",
+                "CHN": "zh",
+                "VNM": "vi",
+                "FRA": "fr",
+                "THA": "th",
+                "PHL": "tl",
+                "KHM": "km",
+            }
+            trnsl_lang_cd = TRNSL_LANG_CD_MAP.get(
+                self.service_info.get("trans_lang", "ENG") if self.service_info else "ENG",
+                "en"
+            )
         
         # generate_determine_prompt를 사용하여 프롬프트 생성
         from prompt.prompts import create_translation_prompt
@@ -138,11 +149,22 @@ class TranslateAgent:
         
         # 2. 청크 나누기 (동적 크기 조정으로 청크 수 최소화)
         original_text = state["original_text"]
-        if len(original_text) <= self.chunk_size:
+        original_text_length = len(original_text)
+        log_msg = f"[청크 분할] 원본 텍스트 길이: {original_text_length}자"
+        LOGGER.info(log_msg)
+        print(log_msg)  # 터미널 출력 보장
+        
+        if original_text_length <= self.chunk_size:
             chunks = [original_text]
+            log_msg = f"[청크 분할] 텍스트가 작아서 청크 분할하지 않음 (길이: {original_text_length} <= {self.chunk_size})"
+            LOGGER.info(log_msg)
+            print(log_msg)  # 터미널 출력 보장
         else:
             # 더 큰 청크 크기 사용 (청크 수 감소로 전체 처리 시간 단축)
-            dynamic_chunk_size = min(self.chunk_size * 2, len(original_text))
+            dynamic_chunk_size = 1000
+            log_msg = f"[청크 분할] 동적 청크 크기: {dynamic_chunk_size}자 (기본 청크 크기: {self.chunk_size}자)"
+            LOGGER.info(log_msg)
+            print(log_msg)  # 터미널 출력 보장
             
             # 오버랩 없이 청크를 나누기 (중복 번역 방지)
             splitter = RecursiveCharacterTextSplitter(
@@ -152,6 +174,16 @@ class TranslateAgent:
                 separators=["\n\n", "\n", ". ", " ", ""]
             )
             chunks = splitter.split_text(original_text)
+            log_msg = f"[청크 분할] 총 {len(chunks)}개 청크로 분할됨"
+            LOGGER.info(log_msg)
+            print(log_msg)  # 터미널 출력 보장
+            
+            # 각 청크 정보 로깅
+            for i, chunk in enumerate(chunks):
+                chunk_preview = chunk[:50] + "..." if len(chunk) > 50 else chunk
+                log_msg = f"[청크 분할] 청크 {i}: 길이 {len(chunk)}자 | 내용 미리보기: {chunk_preview}"
+                LOGGER.info(log_msg)
+                print(log_msg)  # 터미널 출력 보장
         
         # config에서 Queue와 CustomAsyncCallbackHandler 클래스 가져오기 (orchestrator에서 전달, 필수)
         run_config = config or {}
@@ -230,11 +262,13 @@ class TranslateAgent:
             callback_instance = CustomAsyncCallbackHandler(indexed_queue)
             callbacks = [callback_instance]
             
-            # astream을 사용하여 스트리밍 번역 (callbacks 직접 전달)
+            # astream을 사용하여 스트리밍 번역 (config로 callbacks 전달)
+            from langchain_core.runnables.config import RunnableConfig
             result = ""
             last_chunk_response = None
             
-            async for chunk_response in llm_instance.astream(messages, callbacks=callbacks):
+            run_config = RunnableConfig(callbacks=callbacks)
+            async for chunk_response in llm_instance.astream(messages, config=run_config):
                 # 콘텐츠가 있으면 바로 누적
                 if chunk_response.content:
                     result += chunk_response.content
@@ -244,9 +278,16 @@ class TranslateAgent:
             
             # 토큰 사용량 추적 (마지막 청크에서만, 이미지 코드와 동일한 구조)
             if last_chunk_response and last_chunk_response.response_metadata:
-                self.crt_step_inpt_tokn_cnt = last_chunk_response.response_metadata["usage"]["prompt_tokens"]
-                self.crt_step_otpt_tokn_cnt = last_chunk_response.response_metadata["usage"]["completion_tokens"]
-                self.crt_step_totl_tokn_cnt = last_chunk_response.response_metadata["usage"]["total_tokens"]
+                usage = last_chunk_response.response_metadata.get("usage", {})
+                if usage:
+                    self.crt_step_inpt_tokn_cnt = usage.get("prompt_tokens", 0)
+                    self.crt_step_otpt_tokn_cnt = usage.get("completion_tokens", 0)
+                    self.crt_step_totl_tokn_cnt = usage.get("total_tokens", 0)
+                else:
+                    # usage가 없으면 기본값 0으로 설정
+                    self.crt_step_inpt_tokn_cnt = 0
+                    self.crt_step_otpt_tokn_cnt = 0
+                    self.crt_step_totl_tokn_cnt = 0
             
             # 텍스트 교체 로직 (이미지 코드와 동일, 최적화)
             if '\n\n' in result:

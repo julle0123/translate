@@ -1,5 +1,5 @@
 """그래프 모듈"""
-from .translate_node import translate_node
+from .translate_node import TranslateAgent
 
-__all__ = ["translate_node"]
+__all__ = ["TranslateAgent"]
 
