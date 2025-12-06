@@ -22,13 +22,13 @@ class CustomAsyncCallbackHandler(AsyncCallbackHandler):
     
     async def on_llm_new_token(self, token: str, **kwargs) -> None:
         """
-        LLM 토큰 스트리밍 시 호출 (이미지 코드 그대로)
+        LLM 토큰 스트리밍 시 호출 
         
         Args:
             token: 스트리밍되는 토큰
             **kwargs: 추가 인자
         """
-        # 기존 코드 (이미지 코드 그대로 - 주석 처리)
+        # 기존 코드 (주석 처리)
         # if len(kwargs["chunk"].message.response_metadata):
         #     self.prompt_tokens += kwargs["chunk"].message.response_metadata["usage"]["prompt_tokens"]
         #     self.completion_tokens += kwargs["chunk"].message.response_metadata["usage"]["completion_tokens"]
@@ -52,13 +52,13 @@ class CustomAsyncCallbackHandler(AsyncCallbackHandler):
     
     async def on_llm_end(self, response, **kwargs: Any) -> None:
         """
-        LLM 응답 종료 시 호출 (이미지 코드 그대로)
+        LLM 응답 종료 시 호출 
         
         Args:
             response: LLM 응답
             **kwargs: 추가 인자
         """
-        # 기존 코드 (이미지 코드 그대로 - 주석 처리)
+        # 기존 코드 (주석 처리)
         # self.prompt_tokens += response.generations[0][0].message.response_metadata["usage"]["prompt_tokens"]
         # self.completion_tokens += response.generations[0][0].message.response_metadata["usage"]["completion_tokens"]
         # self.total_tokens += response.generations[0][0].message.response_metadata["usage"]["total_tokens"]
