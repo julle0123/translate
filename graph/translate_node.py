@@ -1,4 +1,4 @@
-"""번역 노드 - LangGraph 노드에서 사용하는 번역 함수 (이미지 코드 구조)"""
+"""번역 노드 - LangGraph 노드에서 사용하는 번역 함수 """
 import os
 import asyncio
 import re
@@ -26,7 +26,7 @@ if not LOGGER.handlers:
 
 
 class TranslateAgent:
-    """번역 에이전트 클래스 (이미지 코드 구조)"""
+    """번역 에이전트 클래스 """
     
     def __init__(
         self,
@@ -36,7 +36,7 @@ class TranslateAgent:
         callbacks: Optional[List] = None
     ):
         """
-        초기화 (이미지 코드 구조)
+        초기화 
         
         Args:
             service_info: 서비스 정보
@@ -72,7 +72,7 @@ class TranslateAgent:
         state: TranslationState,
         config: Optional[Dict[str, Any]] = None
     ) -> TranslationState:
-        """LangGraph에서 호출되는 메서드 (이미지 코드 구조)"""
+        """LangGraph에서 호출되는 메서드 """
         self.agent_start_time = time.time()
         if self.service_info:
             state["service_info"] = self.service_info
@@ -89,7 +89,7 @@ class TranslateAgent:
         return state
     
     async def preprocess(self, state: TranslationState) -> TranslationState:
-        """전처리 (이미지 코드 구조)"""
+        """전처리 """
         # service_info에서 lang_cd 가져오기 (orchestrator에서 설정됨)
         # lang_cd가 직접 전달되면 사용, 없으면 trans_lang에서 변환
         if self.service_info and "lang_cd" in self.service_info:
@@ -120,7 +120,7 @@ class TranslateAgent:
         target_lang_name = get_language_name(trnsl_lang_cd)
         prompt = create_translation_prompt(trnsl_lang_cd, target_lang_name)
         
-        # 프롬프트 토큰 수 로깅 (이미지 코드 구조)
+        # 프롬프트 토큰 수 로깅 
         # TODO: 실제 토큰 수 계산 로직 추가 필요
         token = len(prompt.split())  # 간단한 단어 수로 대체
         LOGGER.info(f"프롬프트 토큰 수: {token}")

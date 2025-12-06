@@ -19,7 +19,7 @@ from schema.schemas import SSEChunk
 
 
 class TranslationOrchestrator(BaseOrchestrator):
-    """번역 오케스트레이터 구현 클래스 (이미지 코드 구조)"""
+    """번역 오케스트레이터 구현 클래스 """
     
     def __init__(
         self,
@@ -29,7 +29,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         llm_config: Optional[Dict] = {},
         callbacks: Optional[list] = []
     ):
-        """초기화 (이미지 코드 구조)"""
+        """초기화 """
         self.service_info = service_info
         self.chat_req = chat_req
         self.session_id = session_id
@@ -47,7 +47,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         )
     
     def _get_graph(self):
-        """그래프 생성 (이미지 코드 구조)"""
+        """그래프 생성 """
         if self._graph:
             return self._graph
         
@@ -104,12 +104,12 @@ class TranslationOrchestrator(BaseOrchestrator):
         config: Optional[Dict[str, Any]] = None
     ):
         """
-        스트리밍 방식으로 텍스트 번역 (이미지 코드 구조)
+        스트리밍 방식으로 텍스트 번역 
         """
-        # Queue와 customAsyncCallbackHandler 사용 (이미지 코드 구조)
+        # Queue와 customAsyncCallbackHandler 사용 
         self.queue = Queue()
         
-        # config 설정 (이미지 코드 구조)
+        # config 설정 (
         self.callbacks = [CustomAsyncCallbackHandler(self.queue)]
         config = ensure_config({
             "callbacks": self.callbacks,
@@ -149,7 +149,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         queue_poll_timeout = float(os.getenv("STREAMING_QUEUE_POLL_TIMEOUT", "0.02"))
         queue_max_timeouts = int(os.getenv("STREAMING_QUEUE_MAX_TIMEOUTS", "5"))
         
-        # astream_events로 그래프 실행 (이미지 코드 구조)
+        # astream_events로 그래프 실행 
         import logging
         logger = logging.getLogger(__name__)
         event_count = 0
@@ -230,10 +230,9 @@ class TranslationOrchestrator(BaseOrchestrator):
             if not self.queue.empty() or is_llm_event:
                 await drain_queue_to_buffer(is_llm_event)
             
-            # 모든 이벤트에서 버퍼 처리 로직 실행 (실시간 스트리밍 보장)
+            # 모든 이벤트에서 버퍼 처리 로직 실행 
             # next_expected_index부터 순서대로 처리
             buffer_processed = False
-            initial_streaming_index = streaming_index
             processed_chars_this_event = 0
             
             # LLM 이벤트가 아니면 배치 제한 없이 버퍼를 최대한 비움
@@ -301,19 +300,10 @@ class TranslationOrchestrator(BaseOrchestrator):
                     # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
                     next_expected_index += 1
             
-            # 디버깅: 이벤트 통계 로깅 (100개마다)
-            if event_count % 100 == 0:
-                logger.info(
-                    f"[이벤트 통계] 총 이벤트: {event_count}, "
-                    f"streaming_index: {initial_streaming_index}->{streaming_index}, "
-                    f"next_expected_index: {next_expected_index}, "
-                    f"버퍼 처리: {buffer_processed}, 버퍼 크기: {len(stream_buffer)}"
-                )
             
             # 이벤트 처리
             if event["event"] == "on_chat_model_end":
-                # 청크 완료 감지 (metadata에서 청크 인덱스 추출 시도)
-                # 주의: LangChain 이벤트에서 청크 인덱스를 직접 추출하기 어려울 수 있음
+                # 청크 완료 감지 
                 # 대신 모든 청크가 완료되었는지 확인하는 방식 사용
                 pass
             
