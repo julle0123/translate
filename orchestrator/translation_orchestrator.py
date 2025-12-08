@@ -45,6 +45,11 @@ class TranslationOrchestrator(BaseOrchestrator):
             streaming=True,
             openai_api_key=os.getenv("OPENAI_API_KEY")
         )
+        
+        # 스트리밍 설정 (환경 변수 읽기를 초기화 시 한 번만 수행)
+        self.max_chars_per_event = int(os.getenv("STREAMING_MAX_CHARS_PER_EVENT", "512"))
+        self.queue_poll_timeout = float(os.getenv("STREAMING_QUEUE_POLL_TIMEOUT", "0.02"))
+        self.queue_max_timeouts = int(os.getenv("STREAMING_QUEUE_MAX_TIMEOUTS", "5"))
     
     def _get_graph(self):
         """그래프 생성 """
@@ -134,6 +139,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         
         # time
         start_time = time.time()
+        first_token_sent_time = None  # 첫 토큰 전송 시간
         stream_end = False
         _result = None
         
@@ -145,9 +151,9 @@ class TranslationOrchestrator(BaseOrchestrator):
         last_sent_length = {}  # 각 청크별 마지막 전달 길이 {chunk_index: 길이}
         next_expected_index = 0  # 다음에 처리할 청크 인덱스 (0부터 시작, 청크 번호)
         pending_spaces = {}  # 각 청크별 대기 중인 띄어쓰기 {chunk_index: " "}
-        max_chars_per_event = int(os.getenv("STREAMING_MAX_CHARS_PER_EVENT", "512"))
-        queue_poll_timeout = float(os.getenv("STREAMING_QUEUE_POLL_TIMEOUT", "0.02"))
-        queue_max_timeouts = int(os.getenv("STREAMING_QUEUE_MAX_TIMEOUTS", "5"))
+        max_chars_per_event = self.max_chars_per_event
+        queue_poll_timeout = self.queue_poll_timeout
+        queue_max_timeouts = self.queue_max_timeouts
         
         # astream_events로 그래프 실행 
         import logging
@@ -216,7 +222,7 @@ class TranslationOrchestrator(BaseOrchestrator):
                     allow_wait = False
                     max_empty_checks = 1
         
-        async for event in graph.astream_events(state, config=config):
+        async for event in graph.astream_events(state, config=config, version="v2"):
             event_count += 1
             event_name = event.get("event", "unknown")
             
@@ -279,6 +285,13 @@ class TranslationOrchestrator(BaseOrchestrator):
                         yield sse_chunk.to_msg()
                         streaming_index += 1
                         buffer_processed = True
+                        
+                        # 첫 토큰 전송 시간 측정
+                        if first_token_sent_time is None and streaming_index == 1:
+                            first_token_sent_time = time.time()
+                            elapsed = first_token_sent_time - start_time
+                            logger.info(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
+                            print(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
                         last_sent_length[next_expected_index] = last_length
                         processed_chars_this_event += len(chunk_to_send)
                         

@@ -13,6 +13,7 @@ from langchain_core.callbacks import AsyncCallbackHandler
 
 from state.translation_state import TranslationState
 from prompt.prompts import create_translation_prompt
+from utils.language_utils import get_language_name
 from schema.schemas import ServiceInfo, UserInfo
 
 # 로거 설정
@@ -58,7 +59,7 @@ class TranslateAgent:
         # 설정값 (환경변수 우선, 없으면 기본값)
         self.chunk_size = int(os.getenv("TRANSLATE_CHUNK_SIZE", "2000"))
         self.chunk_overlap = int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "200"))
-        self.max_concurrent = int(os.getenv("TRANSLATE_MAX_CONCURRENT", "5"))
+        self.max_concurrent = int(os.getenv("TRANSLATE_MAX_CONCURRENT", "3"))
         
         # 토큰 사용량 추적 (이미지 코드와 동일한 변수명)
         self.crt_step_inpt_tokn_cnt = 0
@@ -114,9 +115,6 @@ class TranslateAgent:
             )
         
         # generate_determine_prompt를 사용하여 프롬프트 생성
-        from prompt.prompts import create_translation_prompt
-        from utils.language_utils import get_language_name
-        
         target_lang_name = get_language_name(trnsl_lang_cd)
         prompt = create_translation_prompt(trnsl_lang_cd, target_lang_name)
         
@@ -141,11 +139,8 @@ class TranslateAgent:
         사용자의 질문을 LLM을 통해 검색에 최적화된 쿼리로 재작성합니다.
         청크 분할 및 병렬 처리를 포함합니다.
         """
-        # 1. 프롬프트 생성
-        base_prompt = create_translation_prompt(
-            state["target_lang_cd"],
-            state["target_lang_name"]
-        )
+        # 1. 프롬프트는 preprocess()에서 이미 생성됨
+        base_prompt = state["prompt"]
         
         # 2. 청크 나누기 (동적 크기 조정으로 청크 수 최소화)
         original_text = state["original_text"]
@@ -177,64 +172,31 @@ class TranslateAgent:
             log_msg = f"[청크 분할] 총 {len(chunks)}개 청크로 분할됨"
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
-            
-            # 각 청크 정보 로깅
-            for i, chunk in enumerate(chunks):
-                chunk_preview = chunk[:50] + "..." if len(chunk) > 50 else chunk
-                log_msg = f"[청크 분할] 청크 {i}: 길이 {len(chunk)}자 | 내용 미리보기: {chunk_preview}"
-                LOGGER.info(log_msg)
-                print(log_msg)  # 터미널 출력 보장
         
-        # config에서 Queue와 CustomAsyncCallbackHandler 클래스 가져오기 (orchestrator에서 전달, 필수)
+        # config에서 Queue와 CustomAsyncCallbackHandler 클래스 가져오기 (간소화)
         run_config = config or {}
-        queue = None
-        CustomAsyncCallbackHandler = None
         
-        # Queue와 CallbackHandler 클래스 추출
-        if isinstance(run_config, dict):
-            callbacks = run_config.get("callbacks", [])
-            if callbacks:
-                if hasattr(callbacks, 'handlers'):
-                    callbacks_list = callbacks.handlers
-                elif isinstance(callbacks, list):
-                    callbacks_list = callbacks
-                else:
-                    callbacks_list = [callbacks] if callbacks else []
-                
-                if callbacks_list:
-                    first_callback = callbacks_list[0]
-                    if hasattr(first_callback, 'queue'):
-                        queue = first_callback.queue
-            
-            configurable = run_config.get("configurable", {})
-            if not queue:
-                queue = configurable.get("streaming_queue")
-            CustomAsyncCallbackHandler = configurable.get("callback_handler_class")
+        # callbacks에서 queue 추출
+        callbacks = run_config.get("callbacks", [])
+        if hasattr(callbacks, 'handlers'):
+            callbacks_list = callbacks.handlers
+        elif isinstance(callbacks, list):
+            callbacks_list = callbacks
         else:
-            if hasattr(run_config, "callbacks") and run_config.callbacks:
-                callbacks_obj = run_config.callbacks
-                if hasattr(callbacks_obj, 'handlers'):
-                    callbacks_list = callbacks_obj.handlers
-                elif isinstance(callbacks_obj, list):
-                    callbacks_list = callbacks_obj
-                else:
-                    callbacks_list = [callbacks_obj] if callbacks_obj else []
-                
-                if callbacks_list:
-                    first_callback = callbacks_list[0]
-                    if hasattr(first_callback, 'queue'):
-                        queue = first_callback.queue
-            
-            if hasattr(run_config, "configurable") and run_config.configurable:
-                if not queue:
-                    queue = run_config.configurable.get("streaming_queue")
-                CustomAsyncCallbackHandler = run_config.configurable.get("callback_handler_class")
+            callbacks_list = [callbacks] if callbacks else []
         
-        # Queue와 CustomAsyncCallbackHandler가 없으면 에러 (무조건 스트리밍 방식 사용)
+        queue = None
+        if callbacks_list and hasattr(callbacks_list[0], 'queue'):
+            queue = callbacks_list[0].queue
+        
+        # configurable에서 CustomAsyncCallbackHandler 추출
+        configurable = run_config.get("configurable", {})
+        CustomAsyncCallbackHandler = configurable.get("callback_handler_class")
+        
         if not queue:
             raise ValueError("Queue가 필요합니다. 스트리밍 방식으로만 동작합니다.")
         if not CustomAsyncCallbackHandler:
-            raise ValueError("CustomAsyncCallbackHandler 클래스가 필요합니다. orchestrator에서 전달해야 합니다.")
+            raise ValueError("CustomAsyncCallbackHandler 클래스가 필요합니다.")
         
         # llm을 외부 스코프에서 캡처 (중첩 함수에서 self 접근 문제 해결)
         llm_instance = self.llm
@@ -336,57 +298,37 @@ class TranslateAgent:
                 result = await translate_single_chunk(chunk, context_prompt, chunk_index)
                 return chunk_index, result
         
-        # 모든 청크를 병렬로 번역 (인덱스는 0부터 시작)
+        # 첫 번째 청크(청크 0)를 먼저 시작하여 첫 토큰 응답 시간 개선
         tasks = []
-        for i, chunk in enumerate(chunks, start=0):  # 0부터 시작
-            previous_chunk = chunks[i - 1] if i > 0 else None
-            next_chunk = chunks[i + 1] if i < len(chunks) - 1 else None
-            tasks.append(translate_chunk_parallel(chunk, i, previous_chunk, next_chunk))
         
+        # 청크 0 Task를 먼저 생성하여 OpenAI 요청을 먼저 보냄
+        next_chunk_for_0 = chunks[1] if len(chunks) > 1 else None
+        task_0 = translate_chunk_parallel(chunks[0], 0, None, next_chunk_for_0)
+        tasks.append(task_0)
+        
+        # 나머지 청크 Task 생성 (청크 1부터)
+        for i in range(1, len(chunks)):
+            previous_chunk = chunks[i - 1]
+            next_chunk = chunks[i + 1] if i < len(chunks) - 1 else None
+            tasks.append(translate_chunk_parallel(chunks[i], i, previous_chunk, next_chunk))
+        
+        # 모든 Task를 동시에 실행 (청크 0이 먼저 시작되었으므로 첫 토큰이 빨리 도착)
         results = await asyncio.gather(*tasks)
         
         # 인덱스 순서대로 정렬하여 합치기
         sorted_results = sorted(results, key=lambda x: x[0])
         translated_chunks = [translated for _, translated in sorted_results]
         
-        # 재작성된 쿼리를 상태에 업데이트 (이미지 코드와 동일)
+        # 번역된 청크들을 합치기 (chunk_overlap=0이므로 중복 제거 불필요)
         if not translated_chunks:
             final_result = ""
         elif len(translated_chunks) == 1:
             final_result = translated_chunks[0]
         else:
-            # 중복 제거: 각 청크가 이전 청크의 끝 부분과 겹치는지 확인 (최적화)
-            deduplicated_chunks = [translated_chunks[0]]
-            for i in range(1, len(translated_chunks)):
-                chunk = translated_chunks[i]
-                prev_chunk = deduplicated_chunks[-1]
-                
-                # 빠른 중복 체크: 이전 청크의 마지막 50자와 현재 청크의 처음 50자만 비교
-                check_len = min(50, len(prev_chunk), len(chunk))
-                if check_len > 0:
-                    prev_end = prev_chunk[-check_len:]
-                    curr_start = chunk[:check_len]
-                    if prev_end == curr_start:
-                        # 겹치는 부분 제거
-                        deduplicated_chunks.append(chunk[check_len:])
-                    else:
-                        # 더 긴 겹침 확인 (최대 100자)
-                        overlap_found = False
-                        for overlap_len in range(min(100, len(prev_chunk), len(chunk)), check_len, -1):
-                            if prev_chunk[-overlap_len:] == chunk[:overlap_len]:
-                                deduplicated_chunks.append(chunk[overlap_len:])
-                                overlap_found = True
-                                break
-                        if not overlap_found:
-                            deduplicated_chunks.append(chunk)
-                else:
-                    deduplicated_chunks.append(chunk)
-            
-            # 중복 제거된 청크들을 합치기
-            merged = " ".join(deduplicated_chunks)
+            # 단순히 공백으로 합치기
+            merged = " ".join(translated_chunks)
             # 중복된 공백 제거
-            merged = re.sub(r'\s+', ' ', merged)
-            final_result = merged.strip()
+            final_result = re.sub(r'\s+', ' ', merged).strip()
         
         state['answer'] = final_result
         

@@ -148,7 +148,20 @@ async def translate_stream(request: TranslationRequest):
         orchestrator = TranslationOrchestrator(service_info=service_info)
         
         async def generate():
+            import time
+            start_time = time.time()
+            first_token_time = None
+            token_count = 0
+            
             async for chunk in orchestrator.run(message=request.dmnd_msg):
+                token_count += 1
+                
+                # 첫 토큰 시간 측정
+                if first_token_time is None and token_count == 1:
+                    first_token_time = time.time()
+                    elapsed = first_token_time - start_time
+                    print(f"⚡ [첫 토큰] {elapsed:.3f}초 소요 (번역 시작)")
+                
                 yield chunk
         
         return StreamingResponse(
