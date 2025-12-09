@@ -48,7 +48,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         
         # 스트리밍 설정 (환경 변수 읽기를 초기화 시 한 번만 수행)
         self.max_chars_per_event = int(os.getenv("STREAMING_MAX_CHARS_PER_EVENT", "512"))
-        self.queue_poll_timeout = float(os.getenv("STREAMING_QUEUE_POLL_TIMEOUT", "0.02"))
+        self.queue_poll_timeout = float(os.getenv("STREAMING_QUEUE_POLL_TIMEOUT", "0.01"))
         self.queue_max_timeouts = int(os.getenv("STREAMING_QUEUE_MAX_TIMEOUTS", "5"))
     
     def _get_graph(self):
@@ -253,6 +253,9 @@ class TranslationOrchestrator(BaseOrchestrator):
                 if len(current_buffer) > last_length:
                     wait_for_more_tokens = False
                     
+                    # 청크 0은 즉시 전송 (대기 없음)
+                    is_chunk_0 = (next_expected_index == 0)
+                    
                     while len(current_buffer) > last_length:
                         # 현재 위치부터 읽기 시작
                         remaining = current_buffer[last_length:]
@@ -264,9 +267,14 @@ class TranslationOrchestrator(BaseOrchestrator):
                                 chunk_to_send = remaining[:2]
                                 last_length += 2
                             else:
-                                # 다음 글자가 아직 없으면 대기 (다음 이벤트에서 처리)
-                                wait_for_more_tokens = True
-                                break
+                                # 청크 0이 아니면 다음 글자 대기, 청크 0은 즉시 전송
+                                if not is_chunk_0:
+                                    wait_for_more_tokens = True
+                                    break
+                                else:
+                                    # 청크 0은 공백만이라도 즉시 전송
+                                    chunk_to_send = remaining[0]
+                                    last_length += 1
                         else:
                             # 일반 글자는 한 글자씩
                             chunk_to_send = remaining[0]

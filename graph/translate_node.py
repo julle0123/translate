@@ -156,7 +156,7 @@ class TranslateAgent:
             print(log_msg)  # 터미널 출력 보장
         else:
             # 더 큰 청크 크기 사용 (청크 수 감소로 전체 처리 시간 단축)
-            dynamic_chunk_size = 1000
+            dynamic_chunk_size = 500
             log_msg = f"[청크 분할] 동적 청크 크기: {dynamic_chunk_size}자 (기본 청크 크기: {self.chunk_size}자)"
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
@@ -298,22 +298,120 @@ class TranslateAgent:
                 result = await translate_single_chunk(chunk, context_prompt, chunk_index)
                 return chunk_index, result
         
-        # 첫 번째 청크(청크 0)를 먼저 시작하여 첫 토큰 응답 시간 개선
-        tasks = []
+        # 첫 번째 청크를 먼저 시작하고, 첫 토큰 생성 시 나머지 청크 병렬 시작
+        first_token_received = asyncio.Event()
+        first_token_time = None  # 첫 토큰 시간 측정
+        chunk_start_time = time.time()  # 청크 0 시작 시간
         
-        # 청크 0 Task를 먼저 생성하여 OpenAI 요청을 먼저 보냄
-        next_chunk_for_0 = chunks[1] if len(chunks) > 1 else None
-        task_0 = translate_chunk_parallel(chunks[0], 0, None, next_chunk_for_0)
-        tasks.append(task_0)
+        # 첫 번째 청크 전용 번역 함수 (첫 토큰 감지)
+        async def translate_first_chunk():
+            """첫 번째 청크를 번역하고 첫 토큰 수신 시 이벤트 발생"""
+            nonlocal first_token_time
+            chunk = chunks[0]
+            chunk_index = 0
+            next_chunk = chunks[1] if len(chunks) > 1 else None
+            
+            async with semaphore:
+                # 문맥 정보 생성
+                context_info = []
+                if next_chunk:
+                    next_context = next_chunk[:150] if len(next_chunk) > 150 else next_chunk
+                    context_info.append(f"\n[다음 문맥 (참고용)]:\n{next_context}")
+                
+                if context_info:
+                    context_section = "\n".join(context_info)
+                    context_instruction = "\n\n중요: 위의 이전/다음 문맥 정보를 참고하여 자연스럽고 일관된 번역을 제공하세요. 하지만 반드시 주어진 텍스트만 정확하게 번역하세요."
+                    context_prompt = f"{base_prompt}{context_section}{context_instruction}"
+                else:
+                    context_prompt = base_prompt
+                
+                # 번역 시작
+                messages = [
+                    SystemMessage(content=context_prompt),
+                    HumanMessage(content=chunk)
+                ]
+                
+                class IndexedQueue:
+                    def __init__(self, queue: Queue, chunk_index: int):
+                        self.queue = queue
+                        self.chunk_index = chunk_index
+                        self.first_token_sent = False
+                    
+                    async def put(self, item):
+                        nonlocal first_token_time
+                        # 첫 토큰 수신 시 이벤트 발생 및 시간 측정
+                        if not self.first_token_sent and item is not None:
+                            self.first_token_sent = True
+                            first_token_time = time.time()
+                            elapsed = first_token_time - chunk_start_time
+                            first_token_received.set()
+                            LOGGER.info(f"⚡ [첫 토큰 생성] {elapsed:.3f}초 소요 (청크 0)")
+                            print(f"⚡ [첫 토큰 생성] {elapsed:.3f}초 소요 (청크 0)")
+                            LOGGER.info(f"[병렬 처리 트리거] 나머지 청크 {len(chunks)-1}개 시작")
+                            print(f"[병렬 처리 트리거] 나머지 청크 {len(chunks)-1}개 시작")
+                        await self.queue.put((self.chunk_index, item))
+                
+                indexed_queue = IndexedQueue(queue, chunk_index)
+                callback_instance = CustomAsyncCallbackHandler(indexed_queue)
+                callbacks = [callback_instance]
+                
+                from langchain_core.runnables.config import RunnableConfig
+                result = ""
+                last_chunk_response = None
+                
+                run_config = RunnableConfig(callbacks=callbacks)
+                async for chunk_response in llm_instance.astream(messages, config=run_config):
+                    if chunk_response.content:
+                        result += chunk_response.content
+                    last_chunk_response = chunk_response
+                
+                # 토큰 사용량 추적
+                if last_chunk_response and last_chunk_response.response_metadata:
+                    usage = last_chunk_response.response_metadata.get("usage", {})
+                    if usage:
+                        self.crt_step_inpt_tokn_cnt = usage.get("prompt_tokens", 0)
+                        self.crt_step_otpt_tokn_cnt = usage.get("completion_tokens", 0)
+                        self.crt_step_totl_tokn_cnt = usage.get("total_tokens", 0)
+                
+                # 텍스트 교체 로직
+                if '\n\n' in result:
+                    result = result.replace('\n\n', "<<>>")
+                    result = result.replace('\n', '\n\n')
+                    result = result.replace('<<>>', '\n\n')
+                elif '\n' in result:
+                    result = result.replace('\n', '\n\n')
+                
+                return chunk_index, result.strip() if result else ""
         
-        # 나머지 청크 Task 생성 (청크 1부터)
-        for i in range(1, len(chunks)):
-            previous_chunk = chunks[i - 1]
-            next_chunk = chunks[i + 1] if i < len(chunks) - 1 else None
-            tasks.append(translate_chunk_parallel(chunks[i], i, previous_chunk, next_chunk))
+        # 나머지 청크들을 병렬로 처리하는 함수
+        async def translate_remaining_chunks():
+            """첫 토큰 수신 후 나머지 청크들을 병렬 처리"""
+            # 첫 토큰이 올 때까지 대기
+            await first_token_received.wait()
+            
+            LOGGER.info(f"[병렬 처리 시작] 청크 1~{len(chunks)-1} 병렬 번역 시작")
+            print(f"[병렬 처리 시작] 청크 1~{len(chunks)-1} 병렬 번역 시작")
+            
+            # 나머지 청크 Task 생성
+            tasks = []
+            for i in range(1, len(chunks)):
+                previous_chunk = chunks[i - 1]
+                next_chunk = chunks[i + 1] if i < len(chunks) - 1 else None
+                tasks.append(translate_chunk_parallel(chunks[i], i, previous_chunk, next_chunk))
+            
+            # 병렬 실행
+            return await asyncio.gather(*tasks)
         
-        # 모든 Task를 동시에 실행 (청크 0이 먼저 시작되었으므로 첫 토큰이 빨리 도착)
-        results = await asyncio.gather(*tasks)
+        # 첫 번째 청크와 나머지 청크를 동시에 시작 (나머지는 첫 토큰까지 대기)
+        first_chunk_task = asyncio.create_task(translate_first_chunk())
+        remaining_chunks_task = asyncio.create_task(translate_remaining_chunks())
+        
+        # 모든 결과 수집
+        first_result = await first_chunk_task
+        remaining_results = await remaining_chunks_task
+        
+        # 결과 합치기
+        results = [first_result] + list(remaining_results)
         
         # 인덱스 순서대로 정렬하여 합치기
         sorted_results = sorted(results, key=lambda x: x[0])
