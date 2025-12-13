@@ -222,6 +222,15 @@ class TranslationOrchestrator(BaseOrchestrator):
                     allow_wait = False
                     max_empty_checks = 1
         
+        # graph.astream_events 시작 전에 Queue 확인 (첫 토큰 빠른 처리)
+        # 첫 이벤트가 발생하기 전에 Queue에 토큰이 들어올 수 있음
+        for _ in range(5):  # 최대 5번 확인 (약 0.05초)
+            if not self.queue.empty():
+                await drain_queue_to_buffer(allow_wait=False)
+                if next_expected_index in stream_buffer and len(stream_buffer[next_expected_index]) > 0:
+                    break  # 첫 토큰이 있으면 이벤트 루프로 진입
+            await asyncio.sleep(0.01)
+        
         async for event in graph.astream_events(state, config=config, version="v2"):
             event_count += 1
             event_name = event.get("event", "unknown")
@@ -232,9 +241,13 @@ class TranslationOrchestrator(BaseOrchestrator):
                 event_name.startswith("on_chat_")
             )
             
-            # 큐가 비어있지 않거나 대기가 필요한 경우에만 drain 실행
+            # 모든 이벤트에서 Queue 확인 (첫 토큰 빠른 처리)
+            # Queue가 비어있지 않거나 LLM 이벤트인 경우 drain 실행
             if not self.queue.empty() or is_llm_event:
                 await drain_queue_to_buffer(is_llm_event)
+            # Queue가 비어있어도 LLM 이벤트가 아니면 한 번 확인 (첫 토큰 빠른 처리)
+            elif not is_llm_event:
+                await drain_queue_to_buffer(allow_wait=False)
             
             # 모든 이벤트에서 버퍼 처리 로직 실행 
             # next_expected_index부터 순서대로 처리

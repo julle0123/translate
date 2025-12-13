@@ -224,15 +224,18 @@ class TranslateAgent:
             callback_instance = CustomAsyncCallbackHandler(indexed_queue)
             callbacks = [callback_instance]
             
-            # astream을 사용하여 스트리밍 번역 (config로 callbacks 전달)
+            # astream을 사용하여 스트리밍 번역 (각 토큰을 즉시 Queue에 넣기)
             from langchain_core.runnables.config import RunnableConfig
             result = ""
             last_chunk_response = None
             
             run_config = RunnableConfig(callbacks=callbacks)
             async for chunk_response in llm_instance.astream(messages, config=run_config):
-                # 콘텐츠가 있으면 바로 누적
+                # 콘텐츠가 있으면 바로 누적하고 Queue에 즉시 전송
                 if chunk_response.content:
+                    # 각 토큰을 즉시 Queue에 넣기 (callback이 호출되지 않을 수 있으므로 직접 처리)
+                    for char in chunk_response.content:
+                        await indexed_queue.put(char)
                     result += chunk_response.content
                 
                 # 마지막 청크에서만 토큰 사용량 추적 (성능 최적화)
@@ -310,6 +313,7 @@ class TranslateAgent:
             chunk = chunks[0]
             chunk_index = 0
             next_chunk = chunks[1] if len(chunks) > 1 else None
+            result = ""  # 함수 시작 부분에서 초기화
             
             async with semaphore:
                 # 문맥 정보 생성
@@ -356,12 +360,14 @@ class TranslateAgent:
                 callbacks = [callback_instance]
                 
                 from langchain_core.runnables.config import RunnableConfig
-                result = ""
                 last_chunk_response = None
                 
                 run_config = RunnableConfig(callbacks=callbacks)
                 async for chunk_response in llm_instance.astream(messages, config=run_config):
                     if chunk_response.content:
+                        # 각 토큰을 즉시 Queue에 넣기 (callback이 호출되지 않을 수 있으므로 직접 처리)
+                        for char in chunk_response.content:
+                            await indexed_queue.put(char)
                         result += chunk_response.content
                     last_chunk_response = chunk_response
                 
@@ -386,8 +392,11 @@ class TranslateAgent:
         # 나머지 청크들을 병렬로 처리하는 함수
         async def translate_remaining_chunks():
             """첫 토큰 수신 후 나머지 청크들을 병렬 처리"""
-            # 첫 토큰이 올 때까지 대기
-            await first_token_received.wait()
+            # 외부에서 이미 첫 토큰을 기다렸으므로 여기서는 바로 시작
+            
+            # 나머지 청크가 없으면 빈 리스트 반환
+            if len(chunks) <= 1:
+                return []
             
             LOGGER.info(f"[병렬 처리 시작] 청크 1~{len(chunks)-1} 병렬 번역 시작")
             print(f"[병렬 처리 시작] 청크 1~{len(chunks)-1} 병렬 번역 시작")
@@ -399,23 +408,64 @@ class TranslateAgent:
                 next_chunk = chunks[i + 1] if i < len(chunks) - 1 else None
                 tasks.append(translate_chunk_parallel(chunks[i], i, previous_chunk, next_chunk))
             
-            # 병렬 실행
-            return await asyncio.gather(*tasks)
+            # 병렬 실행 (결과를 리스트로 명시적 변환)
+            if tasks:
+                results = await asyncio.gather(*tasks)
+                return list(results)
+            else:
+                return []
         
-        # 첫 번째 청크와 나머지 청크를 동시에 시작 (나머지는 첫 토큰까지 대기)
+        # 첫 번째 청크를 먼저 시작 (스트리밍은 즉시 시작됨)
         first_chunk_task = asyncio.create_task(translate_first_chunk())
+        
+        # 첫 토큰이 나올 때까지 기다린 후 나머지 청크들을 시작
+        # 첫 토큰이 나오면 first_token_received 이벤트가 설정됨
+        await first_token_received.wait()
+        
+        LOGGER.info(f"[첫 토큰 수신 완료] 나머지 청크 {len(chunks)-1}개 시작")
+        print(f"[첫 토큰 수신 완료] 나머지 청크 {len(chunks)-1}개 시작")
+        
+        # 첫 토큰 이후에 나머지 청크들을 시작
         remaining_chunks_task = asyncio.create_task(translate_remaining_chunks())
         
-        # 모든 결과 수집
-        first_result = await first_chunk_task
-        remaining_results = await remaining_chunks_task
+        # 모든 청크를 백그라운드에서 실행하고, 완료될 때까지 대기
+        # 첫 토큰은 이미 Queue를 통해 스트리밍되고 있음
+        first_result, remaining_results = await asyncio.gather(
+            first_chunk_task,
+            remaining_chunks_task
+        )
         
-        # 결과 합치기
-        results = [first_result] + list(remaining_results)
+        # 결과 합치기 (remaining_results를 명시적으로 리스트로 변환)
+        if remaining_results:
+            # remaining_results가 튜플일 수 있으므로 리스트로 변환
+            remaining_list = list(remaining_results) if not isinstance(remaining_results, list) else remaining_results
+            results = [first_result] + remaining_list
+        else:
+            results = [first_result]
+        
+        # 모든 결과가 튜플 형태인지 확인하고 정렬
+        # first_result와 remaining_list의 항목들이 모두 (index, result) 튜플 형태여야 함
+        def get_index(item):
+            """항목에서 인덱스 추출 (튜플이면 첫 번째 요소, 아니면 0)"""
+            if isinstance(item, tuple) and len(item) >= 2:
+                return item[0] if isinstance(item[0], int) else 0
+            return 0
         
         # 인덱스 순서대로 정렬하여 합치기
-        sorted_results = sorted(results, key=lambda x: x[0])
-        translated_chunks = [translated for _, translated in sorted_results]
+        sorted_results = sorted(results, key=get_index)
+        
+        # 정렬된 결과에서 번역된 텍스트만 추출
+        translated_chunks = []
+        for item in sorted_results:
+            if isinstance(item, tuple) and len(item) >= 2:
+                # (index, translated_text) 튜플 형태
+                translated_chunks.append(item[1])
+            elif isinstance(item, str):
+                # 문자열만 있는 경우
+                translated_chunks.append(item)
+            else:
+                # 기타 경우는 무시
+                continue
         
         # 번역된 청크들을 합치기 (chunk_overlap=0이므로 중복 제거 불필요)
         if not translated_chunks:
