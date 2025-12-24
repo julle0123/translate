@@ -233,9 +233,8 @@ class TranslateAgent:
             async for chunk_response in llm_instance.astream(messages, config=run_config):
                 # 콘텐츠가 있으면 바로 누적하고 Queue에 즉시 전송
                 if chunk_response.content:
-                    # 각 토큰을 즉시 Queue에 넣기 (callback이 호출되지 않을 수 있으므로 직접 처리)
-                    for char in chunk_response.content:
-                        await indexed_queue.put(char)
+                    # 토큰을 그대로 Queue에 넣기 (한 글자씩 쪼개지 않음)
+                    await indexed_queue.put(chunk_response.content)
                     result += chunk_response.content
                 
                 # 마지막 청크에서만 토큰 사용량 추적 (성능 최적화)
@@ -365,9 +364,8 @@ class TranslateAgent:
                 run_config = RunnableConfig(callbacks=callbacks)
                 async for chunk_response in llm_instance.astream(messages, config=run_config):
                     if chunk_response.content:
-                        # 각 토큰을 즉시 Queue에 넣기 (callback이 호출되지 않을 수 있으므로 직접 처리)
-                        for char in chunk_response.content:
-                            await indexed_queue.put(char)
+                        # 토큰을 그대로 Queue에 넣기 (한 글자씩 쪼개지 않음)
+                        await indexed_queue.put(chunk_response.content)
                         result += chunk_response.content
                     last_chunk_response = chunk_response
                 

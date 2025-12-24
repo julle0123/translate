@@ -259,80 +259,79 @@ class TranslationOrchestrator(BaseOrchestrator):
             
             # 버퍼에 데이터가 있으면 계속 처리 (이벤트 타입 무관)
             while next_expected_index in stream_buffer:
-                current_buffer = stream_buffer[next_expected_index]
                 last_length = last_sent_length.get(next_expected_index, 0)
                 
+                # 청크 0은 즉시 전송 (대기 없음)
+                is_chunk_0 = (next_expected_index == 0)
+                
                 # 전달할 내용이 있는지 확인
-                if len(current_buffer) > last_length:
-                    wait_for_more_tokens = False
+                wait_for_more_tokens = False
+                while True:
+                    # 버퍼를 매번 새로 읽어오기 (Queue에서 새 토큰이 계속 들어옴)
+                    current_buffer = stream_buffer[next_expected_index]
                     
-                    # 청크 0은 즉시 전송 (대기 없음)
-                    is_chunk_0 = (next_expected_index == 0)
-                    
-                    while len(current_buffer) > last_length:
-                        # 현재 위치부터 읽기 시작
-                        remaining = current_buffer[last_length:]
-                        
-                        # 띄어쓰기로 시작하는 경우 다음 글자까지 읽기
-                        if remaining.startswith(' '):
-                            # 다음 글자가 있으면 함께 보내기
-                            if len(remaining) > 1:
-                                chunk_to_send = remaining[:2]
-                                last_length += 2
-                            else:
-                                # 청크 0이 아니면 다음 글자 대기, 청크 0은 즉시 전송
-                                if not is_chunk_0:
-                                    wait_for_more_tokens = True
-                                    break
-                                else:
-                                    # 청크 0은 공백만이라도 즉시 전송
-                                    chunk_to_send = remaining[0]
-                                    last_length += 1
-                        else:
-                            # 일반 글자는 한 글자씩
-                            chunk_to_send = remaining[0]
-                            last_length += 1
-                        
-                        # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
-                        sse_chunk = SSEChunk(
-                            index=streaming_index,
-                            step="message",
-                            rspns_msg=chunk_to_send,  # answer alias - 문자열만
-                            cmptn_yn=False,  # completion alias
-                            tokn_info={},  # TokenInfo 객체 (기본값)
-                            link_info=[],
-                            src_doc_info=[]
-                        )
-                        yield sse_chunk.to_msg()
-                        streaming_index += 1
-                        buffer_processed = True
-                        
-                        # 첫 토큰 전송 시간 측정
-                        if first_token_sent_time is None and streaming_index == 1:
-                            first_token_sent_time = time.time()
-                            elapsed = first_token_sent_time - start_time
-                            logger.info(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
-                            print(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
-                        last_sent_length[next_expected_index] = last_length
-                        processed_chars_this_event += len(chunk_to_send)
-                        
-                        # 배치 크기 제한 (LLM 이벤트에만 적용)
-                        if processed_chars_this_event >= effective_max_chars:
-                            break
-                    
-                    # 다음 토큰을 기다려야 하거나 배치 한도 도달 시 루프 종료
-                    if wait_for_more_tokens or processed_chars_this_event >= effective_max_chars:
-                        break
-                    
-                    # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
                     if len(current_buffer) <= last_length:
-                        last_sent_length[next_expected_index] = last_length
-                        next_expected_index += 1
-                    else:
+                        # 현재 버퍼를 모두 전송했으면 종료
                         break
-                else:
-                    # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
-                    next_expected_index += 1
+                    
+                    # 현재 위치부터 읽기 시작
+                    remaining = current_buffer[last_length:]
+                    
+                    # 띄어쓰기로 시작하는 경우 다음 글자까지 읽기
+                    if remaining.startswith(' '):
+                        # 다음 글자가 있으면 함께 보내기
+                        if len(remaining) > 1:
+                            chunk_to_send = remaining[:2]
+                            last_length += 2
+                        else:
+                            # 청크 0이 아니면 다음 글자 대기, 청크 0은 즉시 전송
+                            if not is_chunk_0:
+                                wait_for_more_tokens = True
+                                break
+                            else:
+                                # 청크 0은 공백만이라도 즉시 전송
+                                chunk_to_send = remaining[0]
+                                last_length += 1
+                    else:
+                        # 일반 글자는 한 글자씩
+                        chunk_to_send = remaining[0]
+                        last_length += 1
+                    
+                    # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
+                    sse_chunk = SSEChunk(
+                        index=streaming_index,
+                        step="message",
+                        rspns_msg=chunk_to_send,  # answer alias - 문자열만
+                        cmptn_yn=False,  # completion alias
+                        tokn_info={},  # TokenInfo 객체 (기본값)
+                        link_info=[],
+                        src_doc_info=[]
+                    )
+                    yield sse_chunk.to_msg()
+                    streaming_index += 1
+                    buffer_processed = True
+                    
+                    # 첫 토큰 전송 시간 측정
+                    if first_token_sent_time is None and streaming_index == 1:
+                        first_token_sent_time = time.time()
+                        elapsed = first_token_sent_time - start_time
+                        logger.info(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
+                        print(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
+                    
+                    # last_sent_length 업데이트 (매번 업데이트)
+                    last_sent_length[next_expected_index] = last_length
+                    processed_chars_this_event += len(chunk_to_send)
+                    
+                    # 배치 크기 제한 (LLM 이벤트에만 적용)
+                    if processed_chars_this_event >= effective_max_chars:
+                        break
+                
+                # 다음 토큰을 기다려야 하거나 배치 한도 도달 시 루프 종료
+                if wait_for_more_tokens or processed_chars_this_event >= effective_max_chars:
+                    break
+                
+                # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
+                next_expected_index += 1
             
             
             # 이벤트 처리
