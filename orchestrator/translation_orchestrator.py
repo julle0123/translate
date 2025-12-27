@@ -202,7 +202,8 @@ class TranslationOrchestrator(BaseOrchestrator):
                 else:
                     chunk_index, token = (0, chunk)
                 
-                if token is None:
+                # None이거나 빈 문자열이면 스킵
+                if token is None or token == "":
                     continue
                 
                 if chunk_index not in stream_buffer:
@@ -258,52 +259,24 @@ class TranslationOrchestrator(BaseOrchestrator):
             effective_max_chars = max_chars_per_event if is_llm_event else float('inf')
             
             # 버퍼에 데이터가 있으면 계속 처리 (이벤트 타입 무관)
+            # LLM이 반환하는 토큰 단위 그대로 전송 (한 글자씩 나누지 않음)
             while next_expected_index in stream_buffer:
                 last_length = last_sent_length.get(next_expected_index, 0)
+                current_buffer = stream_buffer[next_expected_index]
                 
-                # 청크 0은 즉시 전송 (대기 없음)
-                is_chunk_0 = (next_expected_index == 0)
-                
-                # 전달할 내용이 있는지 확인
-                wait_for_more_tokens = False
-                while True:
-                    # 버퍼를 매번 새로 읽어오기 (Queue에서 새 토큰이 계속 들어옴)
-                    current_buffer = stream_buffer[next_expected_index]
+                # 새로 추가된 내용이 있는지 확인
+                if len(current_buffer) > last_length:
+                    # 새로 추가된 부분만 전송 (LLM 반환 단위 그대로)
+                    chunk_to_send = current_buffer[last_length:]
                     
-                    if len(current_buffer) <= last_length:
-                        # 현재 버퍼를 모두 전송했으면 종료
-                        break
-                    
-                    # 현재 위치부터 읽기 시작
-                    remaining = current_buffer[last_length:]
-                    
-                    # 띄어쓰기로 시작하는 경우 다음 글자까지 읽기
-                    if remaining.startswith(' '):
-                        # 다음 글자가 있으면 함께 보내기
-                        if len(remaining) > 1:
-                            chunk_to_send = remaining[:2]
-                            last_length += 2
-                        else:
-                            # 청크 0이 아니면 다음 글자 대기, 청크 0은 즉시 전송
-                            if not is_chunk_0:
-                                wait_for_more_tokens = True
-                                break
-                            else:
-                                # 청크 0은 공백만이라도 즉시 전송
-                                chunk_to_send = remaining[0]
-                                last_length += 1
-                    else:
-                        # 일반 글자는 한 글자씩
-                        chunk_to_send = remaining[0]
-                        last_length += 1
-                    
-                    # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
+                    # len(current_buffer) > last_length이므로 chunk_to_send는 절대 빈 문자열이 아님
+                    # DataResponse 구조에 맞춰 SSEChunk 생성
                     sse_chunk = SSEChunk(
                         index=streaming_index,
                         step="message",
-                        rspns_msg=chunk_to_send,  # answer alias - 문자열만
-                        cmptn_yn=False,  # completion alias
-                        tokn_info={},  # TokenInfo 객체 (기본값)
+                        rspns_msg=chunk_to_send,  # LLM 반환 단위 그대로 전송
+                        cmptn_yn=False,
+                        tokn_info={},
                         link_info=[],
                         src_doc_info=[]
                     )
@@ -318,20 +291,16 @@ class TranslationOrchestrator(BaseOrchestrator):
                         logger.info(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
                         print(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
                     
-                    # last_sent_length 업데이트 (매번 업데이트)
-                    last_sent_length[next_expected_index] = last_length
+                    # last_sent_length 업데이트 (전송한 길이로 업데이트)
+                    last_sent_length[next_expected_index] = len(current_buffer)
                     processed_chars_this_event += len(chunk_to_send)
                     
                     # 배치 크기 제한 (LLM 이벤트에만 적용)
                     if processed_chars_this_event >= effective_max_chars:
                         break
-                
-                # 다음 토큰을 기다려야 하거나 배치 한도 도달 시 루프 종료
-                if wait_for_more_tokens or processed_chars_this_event >= effective_max_chars:
-                    break
-                
-                # 현재 인덱스의 버퍼가 모두 전달됨 → 다음 인덱스로
-                next_expected_index += 1
+                else:
+                    # 현재 버퍼를 모두 전송했으면 다음 인덱스로
+                    next_expected_index += 1
             
             
             # 이벤트 처리
@@ -467,53 +436,43 @@ class TranslationOrchestrator(BaseOrchestrator):
                         print(f"[on_chain_end] 버퍼 상태: {[(idx, len(buf), last_sent_length.get(idx, 0)) for idx, buf in stream_buffer.items()]}")
                         
                         # Queue에서 남은 토큰을 모두 처리한 후, 버퍼를 즉시 처리
-                        # 버퍼에서 순서대로 처리하는 로직
+                        # LLM 반환 단위 그대로 전송 (한 글자씩 나누지 않음)
                         processed_count = 0
                         while next_expected_index in stream_buffer:
                             current_buffer = stream_buffer[next_expected_index]
                             last_length = last_sent_length.get(next_expected_index, 0)
                             
-                            # 전달할 내용이 있는지 확인
-                            while len(current_buffer) > last_length:
-                                current_char = current_buffer[last_length]
-                                chunk_to_send = None
+                            # 새로 추가된 내용이 있는지 확인
+                            if len(current_buffer) > last_length:
+                                # 새로 추가된 부분만 전송 (LLM 반환 단위 그대로)
+                                chunk_to_send = current_buffer[last_length:]
                                 
-                                # 띄어쓰기인 경우 다음 글자까지 읽어서 함께 보내기
-                                if current_char == ' ':
-                                    # 다음 글자가 있으면 함께 보내기
-                                    if len(current_buffer) > last_length + 1:
-                                        chunk_to_send = current_buffer[last_length:last_length + 2]
-                                        last_length += 2
-                                    else:
-                                        # 다음 글자가 없으면 띄어쓰기만 보내기
-                                        chunk_to_send = current_char
-                                        last_length += 1
-                                else:
-                                    # 일반 글자는 한 글자씩
-                                    chunk_to_send = current_char
-                                    last_length += 1
+                                # len(current_buffer) > last_length이므로 chunk_to_send는 절대 빈 문자열이 아님
+                                # DataResponse 구조에 맞춰 SSEChunk 생성
+                                sse_chunk = SSEChunk(
+                                    index=streaming_index,
+                                    step="message",
+                                    rspns_msg=chunk_to_send,
+                                    cmptn_yn=False,
+                                    tokn_info={},
+                                    link_info=[],
+                                    src_doc_info=[]
+                                )
+                                yield sse_chunk.to_msg()
+                                streaming_index += 1
+                                processed_count += 1
                                 
-                                # chunk_to_send가 정의된 경우에만 전달
-                                if chunk_to_send:
-                                    # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
-                                    sse_chunk = SSEChunk(
-                                        index=streaming_index,
-                                        step="message",
-                                        rspns_msg=chunk_to_send,  # answer alias - 문자열만
-                                        cmptn_yn=False,  # completion alias
-                                        tokn_info={},  # TokenInfo 객체 (기본값)
-                                        link_info=[],
-                                        src_doc_info=[]
-                                    )
-                                    yield sse_chunk.to_msg()
-                                    streaming_index += 1
-                                    processed_count += 1
+                                # last_sent_length 업데이트 (전송한 길이로 업데이트)
+                                last_sent_length[next_expected_index] = len(current_buffer)
                             
-                            # last_sent_length 업데이트
-                            last_sent_length[next_expected_index] = last_length
-                            logger.info(f"[on_chain_end] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}, 전달 길이 {last_length}, 처리된 토큰 수 {processed_count}")
-                            print(f"[on_chain_end] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}, 전달 길이 {last_length}, 처리된 토큰 수 {processed_count}")
-                            next_expected_index += 1
+                            # 버퍼가 모두 전송되었는지 확인 후 다음 인덱스로
+                            if len(current_buffer) <= last_sent_length.get(next_expected_index, 0):
+                                logger.info(f"[on_chain_end] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}, 처리된 청크 수 {processed_count}")
+                                print(f"[on_chain_end] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}, 처리된 청크 수 {processed_count}")
+                                next_expected_index += 1
+                            else:
+                                # 아직 전송할 내용이 있으면 현재 인덱스 유지하고 종료
+                                break
                         
                         logger.info(f"[on_chain_end] 버퍼 처리 완료: 총 처리된 토큰 수 {processed_count}, 최종 streaming_index: {streaming_index}, 최종 next_expected_index: {next_expected_index}")
                         print(f"[on_chain_end] 버퍼 처리 완료: 총 처리된 토큰 수 {processed_count}, 최종 streaming_index: {streaming_index}, 최종 next_expected_index: {next_expected_index}")
@@ -554,51 +513,41 @@ class TranslationOrchestrator(BaseOrchestrator):
         logger.info(f"[루프 종료 후] 남은 버퍼 처리 시작: streaming_index={streaming_index}, next_expected_index={next_expected_index}")
         logger.info(f"[루프 종료 후] 버퍼 상태: {[(idx, len(buf), last_sent_length.get(idx, 0)) for idx, buf in stream_buffer.items()]}")
         
+        # 남은 버퍼 처리 (LLM 반환 단위 그대로 전송)
         while next_expected_index in stream_buffer:
             current_buffer = stream_buffer[next_expected_index]
             last_length = last_sent_length.get(next_expected_index, 0)
             
-            # 전달할 내용이 있는지 확인
-            while len(current_buffer) > last_length:
-                current_char = current_buffer[last_length]
-                chunk_to_send = None
+            # 새로 추가된 내용이 있는지 확인
+            if len(current_buffer) > last_length:
+                # 새로 추가된 부분만 전송 (LLM 반환 단위 그대로)
+                chunk_to_send = current_buffer[last_length:]
                 
-                # 띄어쓰기인 경우 다음 글자까지 읽어서 함께 보내기
-                if current_char == ' ':
-                    # 다음 글자가 있으면 함께 보내기
-                    if len(current_buffer) > last_length + 1:
-                        chunk_to_send = current_buffer[last_length:last_length + 2]
-                        last_length += 2
-                    else:
-                        # 다음 글자가 없으면 띄어쓰기만 보내기
-                        chunk_to_send = current_char
-                        last_length += 1
-                else:
-                    # 일반 글자는 한 글자씩
-                    chunk_to_send = current_char
-                    last_length += 1
+                # len(current_buffer) > last_length이므로 chunk_to_send는 절대 빈 문자열이 아님
+                # DataResponse 구조에 맞춰 SSEChunk 생성
+                sse_chunk = SSEChunk(
+                    index=streaming_index,
+                    step="message",
+                    rspns_msg=chunk_to_send,
+                    cmptn_yn=False,
+                    tokn_info={},
+                    link_info=[],
+                    src_doc_info=[]
+                )
+                yield sse_chunk.to_msg()
+                streaming_index += 1
                 
-                # chunk_to_send가 정의된 경우에만 전달
-                if chunk_to_send:
-                    # DataResponse 구조에 맞춰 SSEChunk 생성 (answer는 문자열만)
-                    sse_chunk = SSEChunk(
-                        index=streaming_index,
-                        step="message",
-                        rspns_msg=chunk_to_send,  # answer alias - 문자열만
-                        cmptn_yn=False,  # completion alias
-                        tokn_info={},  # TokenInfo 객체 (기본값)
-                        link_info=[],
-                        src_doc_info=[]
-                    )
-                    yield sse_chunk.to_msg()
-                    streaming_index += 1
+                # last_sent_length 업데이트 (전송한 길이로 업데이트)
+                last_sent_length[next_expected_index] = len(current_buffer)
             
-            # last_sent_length 업데이트
-            # last_length는 while 루프 시작 전에 초기화되고, 루프 안에서 계속 업데이트됨
-            last_sent_length[next_expected_index] = last_length
-            logger.info(f"[루프 종료 후] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}, 전달 길이 {last_length}")
-            print(f"[루프 종료 후] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}, 전달 길이 {last_length}")
-            next_expected_index += 1
+            # 버퍼가 모두 전송되었는지 확인 후 다음 인덱스로
+            if len(current_buffer) <= last_sent_length.get(next_expected_index, 0):
+                logger.info(f"[루프 종료 후] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}")
+                print(f"[루프 종료 후] 청크 {next_expected_index} 처리 완료: 버퍼 길이 {len(current_buffer)}")
+                next_expected_index += 1
+            else:
+                # 이론적으로는 발생하지 않아야 하지만 안전장치
+                break
         
         logger.info(f"[루프 종료 후] 최종 처리 완료: streaming_index={streaming_index}, next_expected_index={next_expected_index}")
         print(f"[루프 종료 후] 최종 처리 완료: streaming_index={streaming_index}, next_expected_index={next_expected_index}")
