@@ -10,7 +10,6 @@ from langchain_openai import ChatOpenAI
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import HumanMessage, SystemMessage
 from langchain_core.callbacks import AsyncCallbackHandler
-from transformers import AutoTokenizer
 
 from state.translation_state import TranslationState
 from prompt.prompts import create_translation_prompt
@@ -58,9 +57,9 @@ class TranslateAgent:
         self.callbacks = callbacks or []
         
         # 설정값 (환경변수 우선, 없으면 기본값)
-        # chunk_size와 chunk_overlap은 토큰 수로 해석됨
-        self.chunk_size = int(os.getenv("TRANSLATE_CHUNK_SIZE", "1000"))  # 기본값을 토큰 수로 변경 (1000 토큰)
-        self.chunk_overlap = int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "0"))  # 오버랩 없음
+        # chunk_size와 chunk_overlap은 토큰 수로 해석됨 (언어별 차이 고려)
+        self.chunk_size = int(os.getenv("TRANSLATE_CHUNK_SIZE", "1000"))  # 기본값: 1000토큰 (추정치)
+        self.chunk_overlap = int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "100"))  # 기본값: 100토큰 오버랩
         self.max_concurrent = int(os.getenv("TRANSLATE_MAX_CONCURRENT", "3"))
         
         # 토큰 사용량 추적 (이미지 코드와 동일한 변수명)
@@ -68,272 +67,157 @@ class TranslateAgent:
         self.crt_step_otpt_tokn_cnt = 0
         self.crt_step_totl_tokn_cnt = 0
         
-        # transformers AutoTokenizer 초기화 (모델에 맞는 토크나이저 사용)
-        model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-        try:
-            # OpenAI 모델에 대응하는 Hugging Face 토크나이저 매핑
-            # gpt-4o, gpt-4o-mini는 o200k_base와 유사한 토크나이저 사용
-            # OpenAI 모델은 Hugging Face에 직접 매핑되지 않으므로, 유사한 토크나이저 사용
-            if "gpt-4o" in model_name.lower():
-                # o200k_base와 유사한 토크나이저 (GPT-2 기반 또는 cl100k_base 유사)
-                tokenizer_name = "gpt2"  # 또는 "Xenova/gpt-4o-mini" 등이 있다면 사용
-            elif "gpt-4" in model_name.lower() or "gpt-3.5" in model_name.lower():
-                # cl100k_base와 유사한 토크나이저
-                tokenizer_name = "gpt2"
-            else:
-                tokenizer_name = "gpt2"  # 기본값
-            
-            # 환경 변수로 토크나이저 이름을 지정할 수 있음
-            tokenizer_name = os.getenv("TOKENIZER_NAME", tokenizer_name)
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-            LOGGER.info(f"토크나이저 초기화 완료: {tokenizer_name}")
-        except Exception as e:
-            LOGGER.warning(f"토크나이저 초기화 실패, gpt2 사용: {e}")
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
-            except Exception as e2:
-                LOGGER.error(f"기본 토크나이저 초기화도 실패: {e2}")
-                # 폴백: 간단한 문자 수 기반 계산 (토큰 수 근사치)
-                self.tokenizer = None
+        # 토크나이저는 더 이상 필요하지 않음 (간단한 문자 수 기반 분할 사용)
+        self.tokenizer = None
         
-        LOGGER.info(f"TranslateAgent 초기화: chunk_size={self.chunk_size}토큰, chunk_overlap={self.chunk_overlap}토큰, max_concurrent={self.max_concurrent}")
+        LOGGER.info(f"TranslateAgent 초기화: chunk_size={self.chunk_size}토큰(추정), chunk_overlap={self.chunk_overlap}토큰(추정), max_concurrent={self.max_concurrent}")
     
-    def _split_text_by_tokens(
+    def _detect_language_type(self, text: str) -> str:
+        """
+        텍스트의 언어 유형을 감지 (유니코드 범위 기반)
+        
+        지원 언어: 한국어, 영어, 일본어, 중국어, 베트남어, 러시아어, 
+                   태국어, 프랑스어, 몽골어, 크메르어, 필리핀어
+        
+        Args:
+            text: 분석할 텍스트
+        
+        Returns:
+            str: 언어 유형 ('cjk', 'thai', 'khmer', 'mongolian', 'cyrillic', 'latin')
+        """
+        if not text:
+            return 'latin'  # 기본값
+        
+        # 각 언어의 유니코드 범위 확인
+        has_cjk = False  # CJK (중국어, 일본어, 한국어)
+        has_thai = False  # 태국어
+        has_khmer = False  # 크메르어
+        has_mongolian = False  # 몽골어
+        has_cyrillic = False  # 러시아어 (키릴 문자)
+        
+        for char in text:
+            code = ord(char)
+            
+            # CJK 범위: 한자, 한글, 히라가나, 가타카나
+            # 우선순위가 가장 높으므로 발견 즉시 반환
+            if (0x4E00 <= code <= 0x9FAF or  # 한자 (CJK Unified Ideographs)
+                0xAC00 <= code <= 0xD7A3 or  # 한글 (Hangul Syllables)
+                0x3040 <= code <= 0x309F or  # 히라가나 (Hiragana)
+                0x30A0 <= code <= 0x30FF):   # 가타카나 (Katakana)
+                return 'cjk'  # 즉시 반환 (성능 최적화)
+            
+            # 태국어 범위
+            if 0x0E00 <= code <= 0x0E7F:
+                has_thai = True
+            
+            # 크메르어 범위
+            if 0x1780 <= code <= 0x17FF:
+                has_khmer = True
+            
+            # 몽골어 범위
+            if 0x1800 <= code <= 0x18AF:
+                has_mongolian = True
+            
+            # 러시아어 (키릴 문자) 범위
+            if 0x0400 <= code <= 0x04FF:
+                has_cyrillic = True
+        
+        # 우선순위: CJK > 태국어 > 크메르어 > 몽골어 > 키릴 > 라틴
+        if has_cjk:
+            return 'cjk'
+        elif has_thai:
+            return 'thai'
+        elif has_khmer:
+            return 'khmer'
+        elif has_mongolian:
+            return 'mongolian'
+        elif has_cyrillic:
+            return 'cyrillic'
+        else:
+            return 'latin'
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """
+        텍스트의 대략적인 토큰 수 추정 (다국어 지원, 언어별 차이 고려)
+        
+        Args:
+            text: 추정할 텍스트
+        
+        Returns:
+            int: 추정된 토큰 수
+        """
+        if not text:
+            return 0
+        
+        lang_type = self._detect_language_type(text)
+        
+        # 언어 유형별 토큰 밀도 계수
+        # GPT 모델의 토큰화 특성에 기반한 근사치
+        if lang_type == 'cjk':
+            # CJK (중국어, 일본어, 한국어): 1자 ≈ 1.5-2토큰
+            # 한자는 더 많이 나뉠 수 있지만, 평균적으로 1.5로 설정
+            return int(len(text) * 1.5)
+        elif lang_type == 'thai':
+            # 태국어: 1자 ≈ 1.5토큰 (태국 문자는 토큰화 시 많이 나뉨)
+            return int(len(text) * 1.5)
+        elif lang_type == 'khmer':
+            # 크메르어: 1자 ≈ 1.5토큰 (크메르 문자는 토큰화 시 많이 나뉨)
+            return int(len(text) * 1.5)
+        elif lang_type == 'mongolian':
+            # 몽골어: 1자 ≈ 1.5토큰 (몽골 문자는 토큰화 시 많이 나뉨)
+            return int(len(text) * 1.5)
+        elif lang_type == 'cyrillic':
+            # 러시아어 (키릴 문자): 1단어 ≈ 1.3토큰 (라틴 계열과 유사)
+            # 키릴 문자는 단어 단위로 토큰화되므로 단어 수 기준
+            words = text.split()
+            if words:
+                return int(len(words) * 1.3)
+            else:
+                return len(text) // 4
+        else:
+            # 라틴 계열 (영어, 프랑스어, 베트남어, 필리핀어 등)
+            # 1단어 ≈ 1.3토큰, 공백 기준으로 단어 수 계산
+            words = text.split()
+            if words:
+                return int(len(words) * 1.3)
+            else:
+                # 단어가 없으면 (공백만 있거나 특수문자만 있는 경우)
+                return len(text) // 4
+    
+    def _split_text_simple(
         self, 
         text: str, 
         chunk_size: int, 
         chunk_overlap: int = 0
     ) -> List[str]:
         """
-        토큰 수 기반으로 텍스트를 정확하게 청크로 분할
+        간단하고 효과적인 텍스트 분할 (토큰 수 추정 기반)
         
         Args:
             text: 분할할 텍스트
-            chunk_size: 각 청크의 최대 토큰 수
-            chunk_overlap: 청크 간 오버랩 토큰 수
+            chunk_size: 각 청크의 최대 토큰 수 (추정치)
+            chunk_overlap: 청크 간 오버랩 토큰 수 (추정치)
         
         Returns:
             List[str]: 분할된 청크 리스트
         """
-        if self.tokenizer is None:
-            # 토크나이저가 없으면 문자 수 기반으로 폴백
-            LOGGER.warning("토크나이저가 없어 문자 수 기반으로 분할합니다.")
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=chunk_size * 4,  # 대략적인 변환 (토큰 1개 ≈ 4자)
-                chunk_overlap=chunk_overlap * 4,
-                length_function=len,
-                separators=["\n\n", "\n", ". ", " ", ""]
-            )
-            return splitter.split_text(text)
-        
         # 빈 텍스트 처리
         if not text or not text.strip():
             return [text] if text else [""]
         
-        # 텍스트를 토큰으로 인코딩
-        tokens = self.tokenizer.encode(text, add_special_tokens=False)
-        total_tokens = len(tokens)
+        # 토큰 수 추정 함수 사용
+        def length_function(text: str) -> int:
+            return self._estimate_tokens(text)
         
-        if total_tokens <= chunk_size:
-            return [text]
+        # RecursiveCharacterTextSplitter 사용 (토큰 수 추정 기반)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            length_function=length_function,  # 토큰 수 추정 기반
+            separators=["\n\n", "\n", ". ", "! ", "? ", ".", "!", "?", " ", ""]  # 자연스러운 경계에서 분할
+        )
         
-        chunks = []
-        start_idx = 0
-        prev_start_idx = -1  # 무한 루프 방지를 위한 이전 start_idx 추적
-        
-        # 구분자 우선순위 (다국어 지원)
-        # 영어, 한국어, 일본어, 중국어 등 다양한 언어의 구분자 포함
-        separators = [
-            "\n\n",  # 단락 구분
-            "\n",    # 줄바꿈
-            ". ",    # 영어 문장 종료
-            "。",    # 일본어/중국어 문장 종료
-            "！",    # 일본어/중국어 감탄
-            "？",    # 일본어/중국어 의문
-            "! ",    # 영어 감탄
-            "? ",    # 영어 의문
-            ".",     # 영어 문장 종료 (공백 없음)
-            "!",     # 영어 감탄 (공백 없음)
-            "?",     # 영어 의문 (공백 없음)
-            " ",     # 공백 (공백이 있는 언어용)
-            ""       # 최후의 수단
-        ]
-        separator_token_ids = []
-        for sep in separators:
-            if sep:
-                sep_tokens = self.tokenizer.encode(sep, add_special_tokens=False)
-                if sep_tokens:
-                    separator_token_ids.append((sep, sep_tokens))
-        
-        # 최소 청크 크기 (너무 작은 청크 방지)
-        # chunk_size가 1이면 min_chunk_size도 1, 그 외에는 50% 이상
-        min_chunk_size = max(1, chunk_size // 2) if chunk_size > 1 else 1
-        
-        while start_idx < total_tokens:
-            # 현재 청크의 끝 인덱스 계산
-            end_idx = min(start_idx + chunk_size, total_tokens)
-            
-            # 무한 루프 방지: 최소 1토큰은 전진해야 함
-            if end_idx <= start_idx:
-                end_idx = start_idx + 1
-            
-            # 청크 크기를 초과하지 않는 범위에서 구분자 찾기
-            if end_idx < total_tokens:
-                # 끝에서부터 구분자를 찾아서 자연스러운 경계로 조정
-                best_split_idx = end_idx
-                # 검색 범위: 최소 청크 크기를 보장하면서 가능한 한 뒤로 검색
-                # search_start는 start_idx보다 크고 end_idx보다 작아야 함
-                # 검색 범위: 최소 min_chunk_size 이상, 최대 end_idx - 1까지
-                min_search_start = max(start_idx + 1, start_idx + min_chunk_size)
-                max_search_start = end_idx - 1
-                
-                # 선호하는 검색 시작점: 끝에서 50% 지점
-                preferred_start = max(min_search_start, end_idx - chunk_size // 2)
-                search_start = min(preferred_start, max_search_start)
-                
-                # 최종 검증: search_start가 유효한 범위에 있는지 확인
-                if search_start <= start_idx:
-                    search_start = min(start_idx + 1, end_idx - 1)
-                if search_start >= end_idx:
-                    search_start = max(start_idx + 1, end_idx - 1)
-                
-                # search_start가 유효하지 않으면 최소값 사용
-                if search_start <= start_idx or search_start >= end_idx:
-                    search_start = min(start_idx + min_chunk_size, end_idx - 1)
-                    if search_start <= start_idx:
-                        search_start = start_idx + 1
-                
-                # 문장 종료 기호 우선 검색 (다국어 지원)
-                # 영어, 한국어, 일본어, 중국어 문장 종료 기호 포함
-                sentence_endings = [
-                    ". ", "! ", "? ",           # 영어 (공백 포함)
-                    ".\n", "!\n", "?\n",        # 영어 (줄바꿈 포함)
-                    "。", "！", "？",            # 일본어/중국어 (전각 문자, 공백 없음)
-                    "。\n", "！\n", "？\n",      # 일본어/중국어 (줄바꿈 포함)
-                    ".", "!", "?"               # 영어 (공백 없음)
-                ]
-                sentence_end_token_ids = []
-                for ending in sentence_endings:
-                    ending_tokens = self.tokenizer.encode(ending, add_special_tokens=False)
-                    if ending_tokens:
-                        sentence_end_token_ids.append((ending, ending_tokens))
-                
-                # 먼저 문장 종료 기호를 찾기
-                found_sentence_end = False
-                for ending_text, ending_tokens in sentence_end_token_ids:
-                    if not ending_tokens:
-                        continue
-                    
-                    # 구분자 토큰 시퀀스를 찾기 (뒤에서 앞으로)
-                    # 인덱스 범위 체크: end_idx - len(ending_tokens) >= 0이어야 함
-                    search_end = max(0, end_idx - len(ending_tokens))
-                    if search_end < search_start:
-                        continue
-                    
-                    for i in range(search_end, search_start - 1, -1):
-                        if i + len(ending_tokens) > total_tokens:
-                            continue
-                        if tokens[i:i+len(ending_tokens)] == ending_tokens:
-                            # 문장 종료 기호 처리
-                            next_idx = i + len(ending_tokens)
-                            
-                            # 일본어/중국어 전각 문자는 공백 없이도 문장 종료로 인정
-                            is_fullwidth = ending_text in ['。', '！', '？']
-                            
-                            if next_idx < total_tokens:
-                                if is_fullwidth:
-                                    # 전각 문자는 공백 없이도 문장 종료로 인정
-                                    best_split_idx = next_idx
-                                    found_sentence_end = True
-                                    break
-                                else:
-                                    # 영어 문장 종료 기호는 공백/줄바꿈 확인
-                                    next_char_tokens = tokens[next_idx:next_idx+1]
-                                    next_text = self.tokenizer.decode(next_char_tokens, skip_special_tokens=True)
-                                    # 공백, 줄바꿈, 또는 텍스트 끝이면 문장 종료로 인정
-                                    if next_text in [' ', '\n', '\t'] or next_idx >= total_tokens - 1:
-                                        best_split_idx = next_idx
-                                        found_sentence_end = True
-                                        break
-                            else:
-                                # 텍스트 끝이면 문장 종료로 인정
-                                best_split_idx = next_idx
-                                found_sentence_end = True
-                                break
-                    
-                    if found_sentence_end:
-                        break
-                
-                # 문장 종료 기호를 찾지 못했으면 일반 구분자 검색
-                if not found_sentence_end:
-                    for sep_text, sep_tokens in separator_token_ids:
-                        if not sep_tokens:
-                            continue
-                        
-                        # 구분자 토큰 시퀀스를 찾기 (뒤에서 앞으로)
-                        # 인덱스 범위 체크
-                        search_end = max(0, end_idx - len(sep_tokens))
-                        if search_end < search_start:
-                            continue
-                        
-                        for i in range(search_end, search_start - 1, -1):
-                            if i + len(sep_tokens) > total_tokens:
-                                continue
-                            if tokens[i:i+len(sep_tokens)] == sep_tokens:
-                                best_split_idx = i + len(sep_tokens)
-                                break
-                        
-                        if best_split_idx < end_idx:
-                            break
-                
-                # 최소 청크 크기를 보장 (너무 작은 청크 방지)
-                if best_split_idx - start_idx < min_chunk_size:
-                    # 최소 크기보다 작으면 원래 end_idx 사용 (강제 분할)
-                    best_split_idx = end_idx
-                
-                # best_split_idx가 start_idx보다 작거나 같으면 안 됨
-                if best_split_idx <= start_idx:
-                    best_split_idx = end_idx
-                
-                end_idx = best_split_idx
-            
-            # 토큰을 텍스트로 디코딩
-            chunk_tokens = tokens[start_idx:end_idx]
-            chunk_text = self.tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            chunk_text = chunk_text.strip()
-            
-            # 빈 청크 방지 (하지만 start_idx는 반드시 증가해야 함)
-            if chunk_text:
-                chunks.append(chunk_text)
-            else:
-                # 빈 청크가 생성되면 로깅 (이론적으로는 발생하지 않아야 함)
-                LOGGER.warning(f"빈 청크 생성됨: start_idx={start_idx}, end_idx={end_idx}")
-            
-            # 다음 청크 시작 위치 (오버랩 고려)
-            # 무한 루프 방지: 최소 1토큰은 전진해야 함
-            if chunk_overlap > 0 and end_idx < total_tokens:
-                # 오버랩을 고려하되, start_idx는 반드시 증가해야 함
-                # 오버랩이 chunk_size보다 크면 제한
-                effective_overlap = min(chunk_overlap, chunk_size - 1)
-                overlap_start = end_idx - effective_overlap
-                start_idx = max(start_idx + 1, overlap_start)
-                # start_idx가 end_idx보다 크거나 같으면 안 됨
-                if start_idx >= end_idx:
-                    start_idx = end_idx
-            else:
-                start_idx = end_idx
-            
-            # 무한 루프 방지: start_idx가 total_tokens에 도달하면 종료
-            if start_idx >= total_tokens:
-                break
-            
-            # 추가 안전장치: start_idx가 증가하지 않으면 강제로 증가
-            if start_idx <= prev_start_idx and start_idx < total_tokens:
-                LOGGER.warning(f"start_idx가 증가하지 않음: {start_idx}, 강제로 증가")
-                start_idx = min(start_idx + 1, total_tokens)
-            
-            prev_start_idx = start_idx
-        
+        chunks = splitter.split_text(text)
         return chunks
     
     async def __call__(
@@ -414,37 +298,33 @@ class TranslateAgent:
         original_text = state["original_text"]
         original_text_length = len(original_text)
         
-        # 토큰 수를 계산하는 함수
-        def count_tokens(text: str) -> int:
-            """텍스트의 토큰 수를 반환"""
-            if self.tokenizer is not None:
-                # transformers 토크나이저 사용
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                return len(tokens)
-            else:
-                # 폴백: 간단한 근사치 (공백 기준 단어 수 * 1.3)
-                # 정확하지 않지만 기본 동작은 유지
-                return int(len(text.split()) * 1.3)
-        
-        original_token_count = count_tokens(original_text)
-        
-        log_msg = f"[청크 분할] 원본 텍스트: {original_text_length}자, {original_token_count}토큰"
+        # 토큰 수 추정 기반 청크 분할 (다국어 지원, 언어별 차이 고려)
+        lang_type = self._detect_language_type(original_text)
+        estimated_tokens = self._estimate_tokens(original_text)
+        lang_type_names = {
+            'cjk': 'CJK (중국어/일본어/한국어)',
+            'thai': '태국어',
+            'khmer': '크메르어',
+            'mongolian': '몽골어',
+            'cyrillic': '러시아어 (키릴 문자)',
+            'latin': '라틴 계열 (영어/프랑스어/베트남어/필리핀어 등)'
+        }
+        log_msg = f"[청크 분할] 원본 텍스트: {original_text_length}자, 언어 유형: {lang_type_names.get(lang_type, lang_type)}, 추정 토큰 수: {estimated_tokens}토큰"
         LOGGER.info(log_msg)
         print(log_msg)  # 터미널 출력 보장
         
-        if original_token_count <= self.chunk_size:
+        if estimated_tokens <= self.chunk_size:
             chunks = [original_text]
-            log_msg = f"[청크 분할] 텍스트가 작아서 청크 분할하지 않음 ({original_token_count}토큰 <= {self.chunk_size}토큰)"
+            log_msg = f"[청크 분할] 텍스트가 작아서 청크 분할하지 않음 ({estimated_tokens}토큰 <= {self.chunk_size}토큰)"
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
         else:
-            # 토큰 수 기반으로 청크 분할 (정확한 토큰 수 기준)
-            log_msg = f"[청크 분할] 청크 크기: {self.chunk_size}토큰, 오버랩: {self.chunk_overlap}토큰"
+            # 간단하고 효과적인 청크 분할 (토큰 수 추정 기반)
+            log_msg = f"[청크 분할] 청크 크기: {self.chunk_size}토큰(추정), 오버랩: {self.chunk_overlap}토큰(추정)"
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
             
-            # 토큰 수 기반으로 정확하게 청크를 나누기
-            chunks = self._split_text_by_tokens(
+            chunks = self._split_text_simple(
                 original_text, 
                 chunk_size=self.chunk_size, 
                 chunk_overlap=self.chunk_overlap
@@ -454,10 +334,10 @@ class TranslateAgent:
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
             
-            # 각 청크의 토큰 수 로깅
+            # 각 청크의 문자 수 및 추정 토큰 수 로깅
             for i, chunk in enumerate(chunks):
-                chunk_tokens = count_tokens(chunk)
-                LOGGER.info(f"[청크 {i}] 토큰 수: {chunk_tokens}토큰, 문자 수: {len(chunk)}자")
+                chunk_tokens = self._estimate_tokens(chunk)
+                LOGGER.info(f"[청크 {i}] 문자 수: {len(chunk)}자, 추정 토큰 수: {chunk_tokens}토큰")
         
         # config에서 Queue와 CustomAsyncCallbackHandler 클래스 가져오기 (간소화)
         run_config = config or {}

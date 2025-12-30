@@ -236,71 +236,35 @@ class TranslationOrchestrator(BaseOrchestrator):
             event_count += 1
             event_name = event.get("event", "unknown")
             
-            # LLM 관련 이벤트에서만 큐를 대기하면서 확인
-            is_llm_event = (
-                event_name.startswith("on_llm_") or
-                event_name.startswith("on_chat_")
-            )
-            
-            # 모든 이벤트에서 Queue 확인 (첫 토큰 빠른 처리)
-            # Queue가 비어있지 않거나 LLM 이벤트인 경우 drain 실행
-            if not self.queue.empty() or is_llm_event:
-                await drain_queue_to_buffer(is_llm_event)
-            # Queue가 비어있어도 LLM 이벤트가 아니면 한 번 확인 (첫 토큰 빠른 처리)
-            elif not is_llm_event:
-                await drain_queue_to_buffer(allow_wait=False)
-            
-            # 모든 이벤트에서 버퍼 처리 로직 실행 
-            # next_expected_index부터 순서대로 처리
-            buffer_processed = False
-            processed_chars_this_event = 0
-            
-            # LLM 이벤트가 아니면 배치 제한 없이 버퍼를 최대한 비움
-            effective_max_chars = max_chars_per_event if is_llm_event else float('inf')
-            
-            # 버퍼에 데이터가 있으면 계속 처리 (이벤트 타입 무관)
-            # LLM이 반환하는 토큰 단위 그대로 전송 (한 글자씩 나누지 않음)
-            while next_expected_index in stream_buffer:
-                last_length = last_sent_length.get(next_expected_index, 0)
-                current_buffer = stream_buffer[next_expected_index]
-                
-                # 새로 추가된 내용이 있는지 확인
-                if len(current_buffer) > last_length:
-                    # 새로 추가된 부분만 전송 (LLM 반환 단위 그대로)
-                    chunk_to_send = current_buffer[last_length:]
+            # 이미지 코드처럼 on_chat_model_stream에서 직접 큐에서 가져와서 전송
+            if event_name == "on_chat_model_stream":
+                try:
+                    # 큐에서 직접 가져와서 즉시 전송 (이미지 코드 방식)
+                    chunk = await self.queue.get()
                     
-                    # len(current_buffer) > last_length이므로 chunk_to_send는 절대 빈 문자열이 아님
-                    # DataResponse 구조에 맞춰 SSEChunk 생성
-                    sse_chunk = SSEChunk(
-                        index=streaming_index,
-                        step="message",
-                        rspns_msg=chunk_to_send,  # LLM 반환 단위 그대로 전송
-                        cmptn_yn=False,
-                        tokn_info={},
-                        link_info=[],
-                        src_doc_info=[]
-                    )
-                    yield sse_chunk.to_msg()
-                    streaming_index += 1
-                    buffer_processed = True
-                    
-                    # 첫 토큰 전송 시간 측정
-                    if first_token_sent_time is None and streaming_index == 1:
-                        first_token_sent_time = time.time()
-                        elapsed = first_token_sent_time - start_time
-                        logger.info(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
-                        print(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
-                    
-                    # last_sent_length 업데이트 (전송한 길이로 업데이트)
-                    last_sent_length[next_expected_index] = len(current_buffer)
-                    processed_chars_this_event += len(chunk_to_send)
-                    
-                    # 배치 크기 제한 (LLM 이벤트에만 적용)
-                    if processed_chars_this_event >= effective_max_chars:
-                        break
-                else:
-                    # 현재 버퍼를 모두 전송했으면 다음 인덱스로
-                    next_expected_index += 1
+                    if chunk is not None and chunk != "":
+                        # 첫 토큰 전송 시간 측정
+                        if first_token_sent_time is None:
+                            first_token_sent_time = time.time()
+                            elapsed = first_token_sent_time - start_time
+                            logger.info(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
+                            print(f"⚡ [첫 토큰 전송] {elapsed:.3f}초 소요")
+                        
+                        # DataResponse 구조에 맞춰 SSEChunk 생성
+                        sse_chunk = SSEChunk(
+                            index=streaming_index,
+                            step="message",
+                            rspns_msg=chunk,  # 큐에서 가져온 토큰 그대로 전송
+                            cmptn_yn=False,
+                            tokn_info={},
+                            link_info=[],
+                            src_doc_info=[]
+                        )
+                        yield sse_chunk.to_msg()
+                        streaming_index += 1
+                except Exception as e:
+                    logger.error(f"[on_chat_model_stream] 큐 처리 중 오류: {e}")
+                    continue
             
             
             # 이벤트 처리
@@ -444,25 +408,40 @@ class TranslationOrchestrator(BaseOrchestrator):
                             
                             # 새로 추가된 내용이 있는지 확인
                             if len(current_buffer) > last_length:
-                                # 새로 추가된 부분만 전송 (LLM 반환 단위 그대로)
-                                chunk_to_send = current_buffer[last_length:]
+                                # 새로 추가된 부분을 작은 단위로 나눠서 전송
+                                remaining = current_buffer[last_length:]
+                                max_chunk_size = 20  # 한 번에 전송할 최대 문자 수
                                 
-                                # len(current_buffer) > last_length이므로 chunk_to_send는 절대 빈 문자열이 아님
-                                # DataResponse 구조에 맞춰 SSEChunk 생성
-                                sse_chunk = SSEChunk(
-                                    index=streaming_index,
-                                    step="message",
-                                    rspns_msg=chunk_to_send,
-                                    cmptn_yn=False,
-                                    tokn_info={},
-                                    link_info=[],
-                                    src_doc_info=[]
-                                )
-                                yield sse_chunk.to_msg()
-                                streaming_index += 1
-                                processed_count += 1
+                                while remaining:
+                                    if len(remaining) <= max_chunk_size:
+                                        chunk_to_send = remaining
+                                        remaining = ""
+                                    else:
+                                        # 문장 경계나 공백에서 나누기
+                                        split_pos = max_chunk_size
+                                        for i in range(max_chunk_size - 1, max(0, max_chunk_size - 10), -1):
+                                            if remaining[i] in [' ', '\n', '.', '!', '?', '。', '！', '？']:
+                                                split_pos = i + 1
+                                                break
+                                        chunk_to_send = remaining[:split_pos]
+                                        remaining = remaining[split_pos:]
+                                    
+                                    if chunk_to_send:
+                                        sse_chunk = SSEChunk(
+                                            index=streaming_index,
+                                            step="message",
+                                            rspns_msg=chunk_to_send,
+                                            cmptn_yn=False,
+                                            tokn_info={},
+                                            link_info=[],
+                                            src_doc_info=[]
+                                        )
+                                        yield sse_chunk.to_msg()
+                                        streaming_index += 1
+                                        processed_count += 1
+                                        last_sent_length[next_expected_index] = len(current_buffer) - len(remaining)
                                 
-                                # last_sent_length 업데이트 (전송한 길이로 업데이트)
+                                # 마지막 업데이트
                                 last_sent_length[next_expected_index] = len(current_buffer)
                             
                             # 버퍼가 모두 전송되었는지 확인 후 다음 인덱스로
@@ -487,24 +466,9 @@ class TranslationOrchestrator(BaseOrchestrator):
                     continue
             
             elif event["event"] == "on_chain_start":
-                if "langgraph_node" in event.get("metadata", {}).keys():
-                    if event.get("tags", [""])[0] != "seq:step:1":
-                        continue
-                    if event["metadata"]["langgraph_node"] == "TRANSLATE_NODE":
-                        status_message = "번역중.."
-                        # DataResponse 구조에 맞춰 SSEChunk 생성
-                        sse_chunk = SSEChunk(
-                            index=-1,
-                            step="status",
-                            rspns_msg=status_message,  # answer alias
-                            cmptn_yn=False,  # completion alias
-                            tokn_info={},  # TokenInfo 객체 (기본값)
-                            link_info=[],
-                            src_doc_info=[]
-                        )
-                        yield sse_chunk.to_msg()
-                    else:
-                        continue
+                # 상태 메시지는 이미 run 메서드 시작 시 전송하므로 여기서는 스킵
+                # 필요시 다른 이벤트 처리 로직 추가 가능
+                continue
         
         # 남은 버퍼 처리 (띄어쓰기는 다음 단어와 묶어서)
         # streaming_index는 계속 증가 (이미 설정된 값 유지)
@@ -520,24 +484,39 @@ class TranslationOrchestrator(BaseOrchestrator):
             
             # 새로 추가된 내용이 있는지 확인
             if len(current_buffer) > last_length:
-                # 새로 추가된 부분만 전송 (LLM 반환 단위 그대로)
-                chunk_to_send = current_buffer[last_length:]
+                # 새로 추가된 부분을 작은 단위로 나눠서 전송
+                remaining = current_buffer[last_length:]
+                max_chunk_size = 20  # 한 번에 전송할 최대 문자 수
                 
-                # len(current_buffer) > last_length이므로 chunk_to_send는 절대 빈 문자열이 아님
-                # DataResponse 구조에 맞춰 SSEChunk 생성
-                sse_chunk = SSEChunk(
-                    index=streaming_index,
-                    step="message",
-                    rspns_msg=chunk_to_send,
-                    cmptn_yn=False,
-                    tokn_info={},
-                    link_info=[],
-                    src_doc_info=[]
-                )
-                yield sse_chunk.to_msg()
-                streaming_index += 1
+                while remaining:
+                    if len(remaining) <= max_chunk_size:
+                        chunk_to_send = remaining
+                        remaining = ""
+                    else:
+                        # 문장 경계나 공백에서 나누기
+                        split_pos = max_chunk_size
+                        for i in range(max_chunk_size - 1, max(0, max_chunk_size - 10), -1):
+                            if remaining[i] in [' ', '\n', '.', '!', '?', '。', '！', '？']:
+                                split_pos = i + 1
+                                break
+                        chunk_to_send = remaining[:split_pos]
+                        remaining = remaining[split_pos:]
+                    
+                    if chunk_to_send:
+                        sse_chunk = SSEChunk(
+                            index=streaming_index,
+                            step="message",
+                            rspns_msg=chunk_to_send,
+                            cmptn_yn=False,
+                            tokn_info={},
+                            link_info=[],
+                            src_doc_info=[]
+                        )
+                        yield sse_chunk.to_msg()
+                        streaming_index += 1
+                        last_sent_length[next_expected_index] = len(current_buffer) - len(remaining)
                 
-                # last_sent_length 업데이트 (전송한 길이로 업데이트)
+                # 마지막 업데이트
                 last_sent_length[next_expected_index] = len(current_buffer)
             
             # 버퍼가 모두 전송되었는지 확인 후 다음 인덱스로
