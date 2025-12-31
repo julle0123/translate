@@ -59,7 +59,7 @@ class TranslateAgent:
         # 설정값 (환경변수 우선, 없으면 기본값)
         # chunk_size와 chunk_overlap은 토큰 수로 해석됨 (언어별 차이 고려)
         self.chunk_size = int(os.getenv("TRANSLATE_CHUNK_SIZE", "1000"))  # 기본값: 1000토큰 (추정치)
-        self.chunk_overlap = int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "100"))  # 기본값: 100토큰 오버랩
+        self.chunk_overlap = int(os.getenv("TRANSLATE_CHUNK_OVERLAP", "0"))  # 기본값: 100토큰 오버랩
         self.max_concurrent = int(os.getenv("TRANSLATE_MAX_CONCURRENT", "3"))
         
         # 토큰 사용량 추적 (이미지 코드와 동일한 변수명)
@@ -210,11 +210,14 @@ class TranslateAgent:
             return self._estimate_tokens(text)
         
         # RecursiveCharacterTextSplitter 사용 (토큰 수 추정 기반)
+        # chunk_size를 줄여서 안전 마진 확보 (90% 사용)
+        # 자연스러운 구분자를 찾다가 약간 초과할 수 있으므로 여유 확보
+        safe_chunk_size = int(chunk_size * 0.90)
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
+            chunk_size=safe_chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=length_function,  # 토큰 수 추정 기반
-            separators=["\n\n", "\n", ". ", "! ", "? ", ".", "!", "?", " ", ""]  # 자연스러운 경계에서 분할
+            separators=["\n\n", "\n", ". ", "! ", "? ", ", ", "; ", ".", "!", "?", ",", ";", " ", ""]  # 자연스러운 경계에서 분할
         )
         
         chunks = splitter.split_text(text)
@@ -298,6 +301,22 @@ class TranslateAgent:
         original_text = state["original_text"]
         original_text_length = len(original_text)
         
+        # 타겟 언어에 따른 청크 크기 조정 (토큰 효율이 낮은 언어 대응)
+        target_lang_cd = state.get("target_lang_cd", "en")
+        current_chunk_size = self.chunk_size
+        
+        # 크메르어(km/khm), 태국어(th/tha) 등은 출력 토큰이 입력의 2-3배가 될 수 있음
+        # 따라서 청크 크기를 보수적으로 줄여서 안정성 확보
+        # 대소문자 무시하고 체크하기 위해 소문자로 변환
+        target_lang_cd_lower = target_lang_cd.lower()
+        low_efficiency_langs = ['km', 'khm', 'th', 'tha']
+        
+        if target_lang_cd_lower in low_efficiency_langs:
+            current_chunk_size = int(self.chunk_size * 0.5)  # 50%로 축소
+            log_msg = f"[청크 크기 조정] 타겟 언어({target_lang_cd}) 특성을 고려하여 청크 크기 축소: {self.chunk_size} -> {current_chunk_size}"
+            LOGGER.info(log_msg)
+            print(log_msg)
+        
         # 토큰 수 추정 기반 청크 분할 (다국어 지원, 언어별 차이 고려)
         lang_type = self._detect_language_type(original_text)
         estimated_tokens = self._estimate_tokens(original_text)
@@ -313,20 +332,20 @@ class TranslateAgent:
         LOGGER.info(log_msg)
         print(log_msg)  # 터미널 출력 보장
         
-        if estimated_tokens <= self.chunk_size:
+        if estimated_tokens <= current_chunk_size:
             chunks = [original_text]
-            log_msg = f"[청크 분할] 텍스트가 작아서 청크 분할하지 않음 ({estimated_tokens}토큰 <= {self.chunk_size}토큰)"
+            log_msg = f"[청크 분할] 텍스트가 작아서 청크 분할하지 않음 ({estimated_tokens}토큰 <= {current_chunk_size}토큰)"
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
         else:
             # 간단하고 효과적인 청크 분할 (토큰 수 추정 기반)
-            log_msg = f"[청크 분할] 청크 크기: {self.chunk_size}토큰(추정), 오버랩: {self.chunk_overlap}토큰(추정)"
+            log_msg = f"[청크 분할] 청크 크기: {current_chunk_size}토큰(추정), 오버랩: {self.chunk_overlap}토큰(추정)"
             LOGGER.info(log_msg)
             print(log_msg)  # 터미널 출력 보장
             
             chunks = self._split_text_simple(
                 original_text, 
-                chunk_size=self.chunk_size, 
+                chunk_size=current_chunk_size, 
                 chunk_overlap=self.chunk_overlap
             )
             
@@ -390,20 +409,17 @@ class TranslateAgent:
             callback_instance = CustomAsyncCallbackHandler(indexed_queue)
             callbacks = [callback_instance]
             
-            # astream을 사용하여 스트리밍 번역 (각 토큰을 즉시 Queue에 넣기)
+            # astream을 사용하여 스트리밍 번역 (Callback 사용)
             from langchain_core.runnables.config import RunnableConfig
             result = ""
             last_chunk_response = None
             
             run_config = RunnableConfig(callbacks=callbacks)
             async for chunk_response in llm_instance.astream(messages, config=run_config):
-                # 콘텐츠가 있으면 바로 누적하고 Queue에 즉시 전송
+                # 콘텐츠가 있으면 결과에 누적 (Queue 전송은 Callback이 담당)
                 if chunk_response.content:
-                    # 토큰을 그대로 Queue에 넣기 (한 글자씩 쪼개지 않음)
-                    await indexed_queue.put(chunk_response.content)
                     result += chunk_response.content
                 
-                # 마지막 청크에서만 토큰 사용량 추적 (성능 최적화)
                 last_chunk_response = chunk_response
             
             # 토큰 사용량 추적 (마지막 청크에서만, 이미지 코드와 동일한 구조)
@@ -521,19 +537,23 @@ class TranslateAgent:
                         await self.queue.put((self.chunk_index, item))
                 
                 indexed_queue = IndexedQueue(queue, chunk_index)
+                
+                # astream을 사용하여 스트리밍 번역 (Callback 사용)
                 callback_instance = CustomAsyncCallbackHandler(indexed_queue)
                 callbacks = [callback_instance]
                 
                 from langchain_core.runnables.config import RunnableConfig
                 last_chunk_response = None
-                
                 run_config = RunnableConfig(callbacks=callbacks)
-                async for chunk_response in llm_instance.astream(messages, config=run_config):
-                    if chunk_response.content:
-                        # 토큰을 그대로 Queue에 넣기 (한 글자씩 쪼개지 않음)
-                        await indexed_queue.put(chunk_response.content)
-                        result += chunk_response.content
-                    last_chunk_response = chunk_response
+                
+                try:
+                    async for chunk_response in llm_instance.astream(messages, config=run_config):
+                        if chunk_response.content:
+                            result += chunk_response.content
+                        last_chunk_response = chunk_response
+                except Exception as e:
+                    LOGGER.error(f"[청크 {chunk_index}] 스트리밍 중 오류 발생: {type(e).__name__}: {e}")
+                    print(f"[청크 {chunk_index}] 스트리밍 중 오류 발생: {type(e).__name__}: {e}")
                 
                 # 토큰 사용량 추적
                 if last_chunk_response and last_chunk_response.response_metadata:
@@ -645,5 +665,11 @@ class TranslateAgent:
             final_result = re.sub(r'\s+', ' ', merged).strip()
         
         state['answer'] = final_result
+        
+        # 디버깅: 최종 결과 로깅
+        LOGGER.info(f"[TranslateAgent] 최종 번역 결과 길이: {len(final_result)}")
+        LOGGER.info(f"[TranslateAgent] 최종 번역 결과 미리보기: {final_result[:200] if final_result else 'None'}")
+        print(f"[TranslateAgent] 최종 번역 결과 길이: {len(final_result)}")
+        print(f"[TranslateAgent] 최종 번역 결과 미리보기: {final_result[:200] if final_result else 'None'}")
         
         return state

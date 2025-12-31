@@ -141,7 +141,8 @@ class TranslationOrchestrator(BaseOrchestrator):
         start_time = time.time()
         first_token_sent_time = None  # 첫 토큰 전송 시간
         stream_end = False
-        _result = None
+        _result = None  # 최종 결과 저장용
+        final_output = None  # final 메시지용 출력 저장
         
         # 스트리밍 인덱스 (0부터 시작) - response body의 index 필드에 사용
         streaming_index = 0
@@ -164,7 +165,10 @@ class TranslationOrchestrator(BaseOrchestrator):
         stream_buffer = {}  # 각 청크별 스트리밍 버퍼 {chunk_index: "텍스트"}
         last_sent_length = {}  # 각 청크별 마지막 전달 길이 {chunk_index: 길이}
         next_expected_index = 0  # 다음에 처리할 청크 인덱스 (0부터 시작, 청크 번호)
-        pending_spaces = {}  # 각 청크별 대기 중인 띄어쓰기 {chunk_index: " "}
+        # NOTE: 공백을 별도 버퍼링(pending_spaces)하면
+        # - 청크가 공백으로 시작할 때 next_expected_index가 건너뛰어 순서가 깨질 수 있고
+        # - 연속 공백이 유실될 수 있음
+        # 따라서 공백도 일반 문자처럼 stream_buffer에 그대로 누적한다.
         max_chars_per_event = self.max_chars_per_event
         queue_poll_timeout = self.queue_poll_timeout
         queue_max_timeouts = self.queue_max_timeouts
@@ -176,7 +180,7 @@ class TranslationOrchestrator(BaseOrchestrator):
         
         async def drain_queue_to_buffer(allow_wait: bool):
             """Queue에 쌓인 토큰을 하나씩 처리하고 버퍼에 저장"""
-            nonlocal stream_buffer, pending_spaces, next_expected_index, last_sent_length
+            nonlocal stream_buffer, next_expected_index, last_sent_length
             consecutive_empty_checks = 0
             max_empty_checks = queue_max_timeouts if allow_wait else 1
             
@@ -222,17 +226,10 @@ class TranslationOrchestrator(BaseOrchestrator):
                 
                 if chunk_index not in stream_buffer:
                     stream_buffer[chunk_index] = ""
-                    pending_spaces[chunk_index] = ""
                     last_sent_length[chunk_index] = 0
-                
-                # 띄어쓰기 처리
-                if token == ' ':
-                    pending_spaces[chunk_index] = ' '
-                else:
-                    if pending_spaces.get(chunk_index):
-                        stream_buffer[chunk_index] += pending_spaces[chunk_index]
-                        pending_spaces[chunk_index] = ""
-                    stream_buffer[chunk_index] += token
+
+                # 토큰(공백 포함)은 그대로 누적 (중복/순서 꼬임 방지)
+                stream_buffer[chunk_index] += token
                 
                 # 첫 토큰 이후에는 즉시 drain 모드로 전환
                 if allow_wait:
@@ -318,51 +315,33 @@ class TranslationOrchestrator(BaseOrchestrator):
                     # 모든 청크가 완료되었는지 확인
                     if _result and isinstance(_result, dict) and "output" in _result:
                         output = _result["output"]
+                        # final 메시지용 출력 저장 (answer 키가 있든 없든 저장)
+                        final_output = output
+                        logger.info(f"[on_chain_end] final_output 저장: {final_output}")
+                        
                         if isinstance(output, dict) and "answer" in output:
                             # answer가 있으면 번역이 완료된 것으로 간주
-                            # 남은 Queue의 토큰을 버퍼로 옮기기 (타임아웃 에러 방지)
+                            logger.info(f"[on_chain_end] 번역 완료 감지")
+                            print(f"[on_chain_end] 번역 완료 감지")
+                            
+                            # break 전에 남은 Queue를 모두 버퍼로 옮기기
+                            logger.info(f"[on_chain_end] 남은 Queue 처리 시작")
                             consecutive_empty = 0
-                            max_empty = 10  # 연속으로 비어있는 경우 최대 10번
+                            max_empty = 20  # 충분한 시간 대기
                             
                             while consecutive_empty < max_empty:
-                                # 큐가 비어있지 않으면 즉시 처리
                                 if not self.queue.empty():
-                                    consecutive_empty = 0  # 리셋
+                                    consecutive_empty = 0
                                     await drain_queue_to_buffer(allow_wait=False)
                                 else:
-                                    # 큐가 비어있으면 대기 후 다시 확인
                                     consecutive_empty += 1
-                                    await asyncio.sleep(0.01)  # 10ms 대기
+                                    await asyncio.sleep(0.01)
                             
-                            # 버퍼에서 남은 내용 순서대로 전송 (한 번에 하나의 토큰씩, 순서 보장)
-                            # next_expected_index와 일치하는 청크만 전송 (순서 보장)
-                            # next_expected_index가 없으면 건너뛰기 (순서가 맞지 않은 청크는 나중에 처리)
-                            if next_expected_index in stream_buffer:
-                                current_buffer = stream_buffer[next_expected_index]
-                                last_length = last_sent_length.get(next_expected_index, 0)
-                                
-                                if len(current_buffer) > last_length:
-                                    # 한 번에 하나의 문자만 전송 (자연스러운 스트리밍)
-                                    chunk_to_send = current_buffer[last_length:last_length+1]
-                                    if chunk_to_send:
-                                        sse_chunk = SSEChunk(
-                                            index=streaming_index,
-                                            step="message",
-                                            rspns_msg=chunk_to_send,  # 한 번에 하나씩 전송
-                                            cmptn_yn=False,
-                                            tokn_info={},
-                                            link_info=[],
-                                            src_doc_info=[]
-                                        )
-                                        yield sse_chunk.to_msg()
-                                        streaming_index += 1
-                                        last_sent_length[next_expected_index] = last_length + 1
-                                else:
-                                    # 현재 버퍼를 모두 전송했으면 다음 인덱스로
-                                    next_expected_index += 1
+                            logger.info(f"[on_chain_end] Queue 처리 완료, 버퍼 상태: {[(idx, len(buf)) for idx, buf in stream_buffer.items()]}")
+                            print(f"[on_chain_end] Queue 처리 완료, 버퍼 상태: {[(idx, len(buf)) for idx, buf in stream_buffer.items()]}")
                             
-                            # _result 저장
-                            _result = event["data"]
+                            # 이벤트 루프를 종료하고 남은 버퍼 처리로 이동
+                            break
                 except Exception as e:
                     logger.error(f"[on_chain_end] 처리 중 오류: {e}")
                     continue
@@ -386,30 +365,33 @@ class TranslationOrchestrator(BaseOrchestrator):
                 consecutive_empty += 1
                 await asyncio.sleep(0.01)  # 10ms 대기
         
-        # 버퍼에서 남은 내용 순서대로 전송 (한 번에 하나의 토큰씩, 순서 보장)
-        # next_expected_index부터 순서대로만 전송 (순서가 맞지 않은 청크는 건너뛰기)
-        max_iterations = 1000  # 무한 루프 방지
-        iteration = 0
-        while iteration < max_iterations:
-            iteration += 1
-            
-            # next_expected_index가 버퍼에 없으면 건너뛰기 (순서가 맞지 않은 청크는 나중에 처리)
+        # 버퍼에서 남은 내용 순서대로 전송 (모든 버퍼 내용 전송)
+        # next_expected_index부터 순서대로만 전송 (순서 보장)
+        logger.info(f"[루프 종료 후] 버퍼 전송 시작, streaming_index={streaming_index}")
+        print(f"[루프 종료 후] 버퍼 전송 시작, streaming_index={streaming_index}")
+        
+        # 버퍼에 남아있는 가장 큰 인덱스 확인
+        max_buffered_index = max(stream_buffer.keys()) if stream_buffer else -1
+        
+        while next_expected_index <= max_buffered_index:
+            # next_expected_index가 버퍼에 없으면 (번역 실패/누락 등) 건너뛰기
             if next_expected_index not in stream_buffer:
-                # 다음 인덱스가 있는지 확인 (순서가 맞지 않은 청크가 있을 수 있음)
-                # 하지만 순서 보장을 위해 next_expected_index만 전송
-                break
+                logger.warning(f"[Buffer] 인덱스 {next_expected_index} 누락됨, 건너뜁니다.")
+                print(f"[Buffer] 인덱스 {next_expected_index} 누락됨, 건너뜁니다.")
+                next_expected_index += 1
+                continue
             
             current_buffer = stream_buffer[next_expected_index]
             last_length = last_sent_length.get(next_expected_index, 0)
             
-            if len(current_buffer) > last_length:
-                # 한 번에 하나의 문자만 전송 (자연스러운 스트리밍)
+            # 현재 청크의 모든 내용 전송
+            while len(current_buffer) > last_length:
                 chunk_to_send = current_buffer[last_length:last_length+1]
                 if chunk_to_send:
                     sse_chunk = SSEChunk(
                         index=streaming_index,
                         step="message",
-                        rspns_msg=chunk_to_send,  # 한 번에 하나씩 전송
+                        rspns_msg=chunk_to_send,
                         cmptn_yn=False,
                         tokn_info={},
                         link_info=[],
@@ -417,23 +399,35 @@ class TranslationOrchestrator(BaseOrchestrator):
                     )
                     yield sse_chunk.to_msg()
                     streaming_index += 1
-                    last_sent_length[next_expected_index] = last_length + 1
-                    # 한 번에 하나만 전송하고 계속 (루프 종료 후이므로 모두 전송)
-                    continue
-            else:
-                # 현재 버퍼를 모두 전송했으면 다음 인덱스로
-                next_expected_index += 1
-                continue
+                    last_length += 1
+            
+            # 현재 청크 완료, 다음 청크로
+            last_sent_length[next_expected_index] = last_length
+            next_expected_index += 1
+        
+        logger.info(f"[루프 종료 후] 버퍼 전송 완료, 최종 streaming_index={streaming_index}")
+        print(f"[루프 종료 후] 버퍼 전송 완료, 최종 streaming_index={streaming_index}")
         
         # _result 안전하게 처리
         result = None
+        logger.info(f"[Final 처리] _result: {_result is not None}, final_output: {final_output is not None}")
+        
         if _result and isinstance(_result, dict) and "output" in _result:
             result = _result["output"]
+            logger.info(f"[Final 처리] _result에서 가져옴: {type(result)}")
+        elif final_output:
+            # on_chain_end에서 저장한 final_output 사용
+            result = final_output
+            logger.info(f"[Final 처리] final_output에서 가져옴: {type(result)}")
+        
         self.result = result
         
         # final 메시지 전송 (DataResponse 구조에 맞춰)
         if result:
             final_answer = result.get("answer", "") if isinstance(result, dict) else str(result)
+            logger.info(f"[Final 메시지] answer 길이: {len(final_answer)}, 내용: {final_answer[:100] if final_answer else 'None'}")
+            print(f"[Final 메시지] answer 길이: {len(final_answer)}, 내용: {final_answer[:100] if final_answer else 'None'}")
+            
             sse_chunk = SSEChunk(
                 index=-1,
                 step="final",
@@ -444,3 +438,6 @@ class TranslationOrchestrator(BaseOrchestrator):
                 src_doc_info=[]
             )
             yield sse_chunk.to_msg()
+        else:
+            logger.warning("[Final 메시지] result가 None입니다!")
+            print("[Final 메시지] result가 None입니다!")
