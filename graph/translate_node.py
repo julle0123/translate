@@ -83,7 +83,7 @@ class TranslateAgent:
             text: 분석할 텍스트
         
         Returns:
-            str: 언어 유형 ('cjk', 'thai', 'khmer', 'mongolian', 'cyrillic', 'latin')
+            str: 언어 유형 ('cjk', 'thai', 'khmer', 'mongolian', 'mongolian_cyrillic', 'cyrillic', 'latin')
         """
         if not text:
             return 'latin'  # 기본값
@@ -92,8 +92,9 @@ class TranslateAgent:
         has_cjk = False  # CJK (중국어, 일본어, 한국어)
         has_thai = False  # 태국어
         has_khmer = False  # 크메르어
-        has_mongolian = False  # 몽골어
-        has_cyrillic = False  # 러시아어 (키릴 문자)
+        has_mongolian = False  # 몽골어 (전통 문자)
+        has_cyrillic = False  # 키릴 문자 (러시아어)
+        has_mongolian_cyrillic = False  # 몽골어 키릴 확장 문자
         
         for char in text:
             code = ord(char)
@@ -114,15 +115,24 @@ class TranslateAgent:
             if 0x1780 <= code <= 0x17FF:
                 has_khmer = True
             
-            # 몽골어 범위
+            # 몽골어 범위 (전통 몽골 문자)
             if 0x1800 <= code <= 0x18AF:
                 has_mongolian = True
             
-            # 러시아어 (키릴 문자) 범위
-            if 0x0400 <= code <= 0x04FF:
+            # 몽골어 키릴 확장 문자 (Ө, Ү 등)
+            # 0x04E8-0x04E9: Ө ө (몽골어 전용)
+            # 0x04AE-0x04AF: Ү ү (몽골어 전용)
+            if code in [0x04E8, 0x04E9, 0x04AE, 0x04AF]:
+                has_mongolian_cyrillic = True
+            
+            # 키릴 문자 범위 (러시아어, 몽골어 등)
+            # 0x0400-0x04FF: Cyrillic (기본)
+            # 0x0500-0x052F: Cyrillic Supplement (확장)
+            if (0x0400 <= code <= 0x04FF or  # Cyrillic
+                0x0500 <= code <= 0x052F):   # Cyrillic Supplement
                 has_cyrillic = True
         
-        # 우선순위: CJK > 태국어 > 크메르어 > 몽골어 > 키릴 > 라틴
+        # 우선순위: CJK > 태국어 > 크메르어 > 몽골어(전통) > 몽골어(키릴) > 키릴 > 라틴
         if has_cjk:
             return 'cjk'
         elif has_thai:
@@ -131,6 +141,8 @@ class TranslateAgent:
             return 'khmer'
         elif has_mongolian:
             return 'mongolian'
+        elif has_mongolian_cyrillic:
+            return 'mongolian_cyrillic'  # 몽골어 키릴 문자
         elif has_cyrillic:
             return 'cyrillic'
         else:
@@ -158,28 +170,50 @@ class TranslateAgent:
             # 한자는 더 많이 나뉠 수 있지만, 평균적으로 1.5로 설정
             return int(len(text) * 1.5)
         elif lang_type == 'thai':
-            # 태국어: 1자 ≈ 1.5토큰 (태국 문자는 토큰화 시 많이 나뉨)
-            return int(len(text) * 1.5)
+            # 태국어: 1자 ≈ 1.3토큰 (실제 측정 결과 기반)
+            # 태국어는 공백 없이 연속되지만 GPT 토크나이저는 의미 단위로 묶음
+            return int(len(text) * 1.3)
         elif lang_type == 'khmer':
-            # 크메르어: 1자 ≈ 1.5토큰 (크메르 문자는 토큰화 시 많이 나뉨)
-            return int(len(text) * 1.5)
+            # 크메르어: 1자 ≈ 1.2-1.5토큰 (실제 측정 결과 기반)
+            # 크메르어는 공백 없이 연속되지만 GPT 토크나이저는 의미 단위로 묶음
+            # 과대평가 방지를 위해 1.2 계수 사용
+            return int(len(text) * 1.2)
         elif lang_type == 'mongolian':
-            # 몽골어: 1자 ≈ 1.5토큰 (몽골 문자는 토큰화 시 많이 나뉨)
+            # 전통 몽골 문자: 1자 ≈ 1.5토큰 (몽골 문자는 토큰화 시 많이 나뉨)
             return int(len(text) * 1.5)
-        elif lang_type == 'cyrillic':
-            # 러시아어 (키릴 문자): 1단어 ≈ 1.3토큰 (라틴 계열과 유사)
+        elif lang_type == 'mongolian_cyrillic':
+            # 몽골어 키릴 문자: 1단어 ≈ 1.5토큰
             # 키릴 문자는 단어 단위로 토큰화되므로 단어 수 기준
             words = text.split()
             if words:
-                return int(len(words) * 1.3)
+                # 단어 수 기반 계산과 문자 수 기반 계산 중 큰 값 사용
+                token_by_words = int(len(words) * 1.5)
+                token_by_chars = int(len(text) * 0.35)  # 1자당 0.35토큰 (키릴 문자)
+                return max(token_by_words, token_by_chars)
+            else:
+                return len(text) // 4
+        elif lang_type == 'cyrillic':
+            # 러시아어/몽골어 (키릴 문자): 1단어 ≈ 1.5토큰 (라틴 계열과 유사)
+            # 키릴 문자는 단어 단위로 토큰화되므로 단어 수 기준
+            words = text.split()
+            if words:
+                # 단어 수 기반 계산과 문자 수 기반 계산 중 큰 값 사용
+                token_by_words = int(len(words) * 1.5)
+                token_by_chars = int(len(text) * 0.35)  # 1자당 0.35토큰 (키릴 문자는 라틴보다 토큰이 많음)
+                return max(token_by_words, token_by_chars)
             else:
                 return len(text) // 4
         else:
             # 라틴 계열 (영어, 프랑스어, 베트남어, 필리핀어 등)
-            # 1단어 ≈ 1.3토큰, 공백 기준으로 단어 수 계산
+            # 1단어 ≈ 1.5토큰 (실제 측정 결과, 필리핀어/프랑스어는 단어가 길어 토큰이 많음)
+            # 공백 기준으로 단어 수 계산
             words = text.split()
             if words:
-                return int(len(words) * 1.3)
+                # 단어 수 기반 계산과 문자 수 기반 계산 중 큰 값 사용
+                # (긴 텍스트가 과소평가되는 것 방지)
+                token_by_words = int(len(words) * 1.5)
+                token_by_chars = int(len(text) * 0.3)  # 1자당 0.3토큰 (최소 기준)
+                return max(token_by_words, token_by_chars)
             else:
                 # 단어가 없으면 (공백만 있거나 특수문자만 있는 경우)
                 return len(text) // 4
@@ -217,7 +251,9 @@ class TranslateAgent:
             chunk_size=safe_chunk_size,
             chunk_overlap=chunk_overlap,
             length_function=length_function,  # 토큰 수 추정 기반
-            separators=["\n\n", "\n", ". ", "! ", "? ", ", ", "; ", ".", "!", "?", ",", ";", " ", ""]  # 자연스러운 경계에서 분할
+            # separators 우선순위: 문단 > 문장 > 절 > 단어 > 글자
+            # \n은 후순위로 (문장 중간에서 자르지 않기 위함)
+            separators=["\n\n", ". ", "! ", "? ", "; ", ", ", ".", "!", "?", ";", ",", "\n", " ", ""]
         )
         
         chunks = splitter.split_text(text)
@@ -312,7 +348,8 @@ class TranslateAgent:
         low_efficiency_langs = ['km', 'khm', 'th', 'tha']
         
         if target_lang_cd_lower in low_efficiency_langs:
-            current_chunk_size = int(self.chunk_size * 0.5)  # 50%로 축소
+            # 영어 -> 크메르어/태국어: 출력이 훨씬 길어지므로 30%로 축소
+            current_chunk_size = int(self.chunk_size * 0.3)
             log_msg = f"[청크 크기 조정] 타겟 언어({target_lang_cd}) 특성을 고려하여 청크 크기 축소: {self.chunk_size} -> {current_chunk_size}"
             LOGGER.info(log_msg)
             print(log_msg)
@@ -324,7 +361,8 @@ class TranslateAgent:
             'cjk': 'CJK (중국어/일본어/한국어)',
             'thai': '태국어',
             'khmer': '크메르어',
-            'mongolian': '몽골어',
+            'mongolian': '몽골어 (전통 문자)',
+            'mongolian_cyrillic': '몽골어 (키릴 문자)',
             'cyrillic': '러시아어 (키릴 문자)',
             'latin': '라틴 계열 (영어/프랑스어/베트남어/필리핀어 등)'
         }
@@ -473,7 +511,8 @@ class TranslateAgent:
                 
                 if context_info:
                     context_section = "\n".join(context_info)
-                    context_instruction = "\n\n중요: 위의 이전/다음 문맥 정보를 참고하여 자연스럽고 일관된 번역을 제공하세요. 하지만 반드시 주어진 텍스트만 정확하게 번역하세요."
+                    target_lang_name = state.get('target_lang_name', '목표 언어')
+                    context_instruction = f"\n\n중요: 위의 이전/다음 문맥 정보는 참고용입니다. 반드시 [번역할 텍스트] 부분만 정확하게 {target_lang_name}로 번역하세요. 문맥 정보를 번역 결과에 포함하지 마세요. 원문 언어를 그대로 출력하지 말고, 오직 {target_lang_name}로만 번역하세요."
                     context_prompt = f"{base_prompt}{context_section}{context_instruction}"
                 else:
                     context_prompt = base_prompt
@@ -505,7 +544,8 @@ class TranslateAgent:
                 
                 if context_info:
                     context_section = "\n".join(context_info)
-                    context_instruction = "\n\n중요: 위의 이전/다음 문맥 정보를 참고하여 자연스럽고 일관된 번역을 제공하세요. 하지만 반드시 주어진 텍스트만 정확하게 번역하세요."
+                    target_lang_name = state.get('target_lang_name', '목표 언어')
+                    context_instruction = f"\n\n중요: 위의 이전/다음 문맥 정보는 참고용입니다. 반드시 [번역할 텍스트] 부분만 정확하게 {target_lang_name}로 번역하세요. 문맥 정보를 번역 결과에 포함하지 마세요. 원문 언어를 그대로 출력하지 말고, 오직 {target_lang_name}로만 번역하세요."
                     context_prompt = f"{base_prompt}{context_section}{context_instruction}"
                 else:
                     context_prompt = base_prompt
